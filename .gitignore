@@ -172,3 +172,5 @@ edit_result/
 visualization/data
 
 .ipynb_checkpoints/
+vis_*/
+deps/

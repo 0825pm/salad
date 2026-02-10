@@ -4,8 +4,13 @@ import torch.nn as nn
 from models.skeleton.conv import ResSTConv, get_activation
 from models.skeleton.pool import STPool, STUnpool
 from utils.paramUtil import kit_adj_list, t2m_adj_list
+from utils.sign_paramUtil import sign_adj_list, SIGN_SPLITS, get_sign_config
 from utils.skeleton import adj_list_to_edges
 
+
+# ══════════════════════════════════════════════════════════════
+# Original SALAD: 263D HumanML3D
+# ══════════════════════════════════════════════════════════════
 
 class MotionEncoder(nn.Module):
     def __init__(self, opt):
@@ -31,39 +36,22 @@ class MotionEncoder(nn.Module):
             ))
 
     def forward(self, x):
-        """
-        x: [bs, nframes, pose_dim]
-        
-        nfeats = 12J + 1
-            - root_rot_velocity (B, seq_len, 1)
-            - root_linear_velocity (B, seq_len, 2)
-            - root_y (B, seq_len, 1)
-            - ric_data (B, seq_len, (joint_num - 1)*3)
-            - rot_data (B, seq_len, (joint_num - 1)*6)
-            - local_velocity (B, seq_len, joint_num*3)
-            - foot contact (B, seq_len, 4)
-        """
         B, T, D = x.size()
-
-        # split
         root, ric, rot, vel, contact = torch.split(x, [4, 3 * (self.joints_num - 1), 6 * (self.joints_num - 1), 3 * self.joints_num, 4], dim=-1)
         ric = ric.reshape(B, T, self.joints_num - 1, 3)
         rot = rot.reshape(B, T, self.joints_num - 1, 6)
         vel = vel.reshape(B, T, self.joints_num, 3)
 
-        # joint-wise input
-        joints = [torch.cat([root, vel[:, :, 0]], dim=-1)] # [B, T, 7]]
+        joints = [torch.cat([root, vel[:, :, 0]], dim=-1)]
         for i in range(1, self.joints_num):
             joints.append(torch.cat([ric[:, :, i - 1], rot[:, :, i - 1], vel[:, :, i]], dim=-1))
         for cidx, jidx in enumerate(self.contact_joints):
             joints[jidx] = torch.cat([joints[jidx], contact[:, :, cidx, None]], dim=-1)
         
-        # encode
         out = []
         for i in range(self.joints_num):
             out.append(self.layers[i](joints[i]))
         out = torch.stack(out, dim=2)
-
         return out
 
 
@@ -76,7 +64,6 @@ class MotionDecoder(nn.Module):
         self.latent_dim = opt.latent_dim
         self.contact_joints = opt.contact_joints
 
-        # network components
         self.layers = nn.ModuleList()
         for i in range(self.joints_num):
             if i == 0:
@@ -92,9 +79,6 @@ class MotionDecoder(nn.Module):
             ))
 
     def forward(self, x):
-        """
-        x: [bs, nframes, joints_num, latent_dim]
-        """
         B, T, J, D = x.size()
         
         out = []
@@ -107,7 +91,6 @@ class MotionDecoder(nn.Module):
             ric = out[i][:, :, :3]
             rot = out[i][:, :, 3:9]
             vel = out[i][:, :, 9:12]
-
             ric_list.append(ric)
             rot_list.append(rot)
             vel_list.append(vel)
@@ -120,31 +103,88 @@ class MotionDecoder(nn.Module):
         contact = torch.stack(contact, dim=2).reshape(B, T, len(self.contact_joints))
 
         motion = torch.cat([
-            root[..., :4], # root
-            ric, # ric
-            rot, # rot
-            torch.cat([root[..., 4:], vel], dim=-1), # vel
-            contact, # contact
+            root[..., :4],
+            ric,
+            rot,
+            torch.cat([root[..., 4:], vel], dim=-1),
+            contact,
         ], dim=-1)
 
         return motion
 
 
+# ══════════════════════════════════════════════════════════════
+# NEW: Sign Language 133D  (7 super-joints)
+# ══════════════════════════════════════════════════════════════
+
+class SignMotionEncoder(nn.Module):
+    """Per-part linear projection: [B, T, 133] → [B, T, J, D]"""
+    def __init__(self, opt):
+        super().__init__()
+        self.latent_dim = opt.latent_dim
+        skeleton_mode = getattr(opt, 'skeleton_mode', '7part')
+        self.splits, _, _, _ = get_sign_config(skeleton_mode)
+
+        self.layers = nn.ModuleList()
+        for dim in self.splits:
+            self.layers.append(nn.Sequential(
+                nn.Linear(dim, self.latent_dim),
+                get_activation(opt.activation),
+                nn.Linear(self.latent_dim, self.latent_dim),
+            ))
+
+    def forward(self, x):
+        """x: [B, T, 133]  →  [B, T, J, D]"""
+        parts = torch.split(x, self.splits, dim=-1)
+        out = [self.layers[i](parts[i]) for i in range(len(self.splits))]
+        return torch.stack(out, dim=2)
+
+
+class SignMotionDecoder(nn.Module):
+    """Per-part projection back: [B, T, J, D] → [B, T, 133]"""
+    def __init__(self, opt):
+        super().__init__()
+        self.latent_dim = opt.latent_dim
+        skeleton_mode = getattr(opt, 'skeleton_mode', '7part')
+        self.splits, _, _, _ = get_sign_config(skeleton_mode)
+
+        self.layers = nn.ModuleList()
+        for dim in self.splits:
+            self.layers.append(nn.Sequential(
+                nn.Linear(self.latent_dim, self.latent_dim),
+                get_activation(opt.activation),
+                nn.Linear(self.latent_dim, dim),
+            ))
+
+    def forward(self, x):
+        """x: [B, T, J, D]  →  [B, T, 133]"""
+        parts = [self.layers[i](x[:, :, i]) for i in range(len(self.splits))]
+        return torch.cat(parts, dim=-1)
+
+
+# ══════════════════════════════════════════════════════════════
+# STConv Encoder / Decoder  (shared, dataset-aware)
+# ══════════════════════════════════════════════════════════════
+
 class STConvEncoder(nn.Module):
     def __init__(self, opt):
         super(STConvEncoder, self).__init__()
 
-        # adjacency list
-        self.adj_list = {
+        ## ── PATCH: add sign adj_list (skeleton_mode aware) ──
+        adj_lists = {
             "t2m": t2m_adj_list,
             "kit": kit_adj_list,
-        }[opt.dataset_name]
+        }
+        if opt.dataset_name == "sign":
+            skeleton_mode = getattr(opt, 'skeleton_mode', '7part')
+            _, self.adj_list, _, _ = get_sign_config(skeleton_mode)
+        else:
+            self.adj_list = adj_lists[opt.dataset_name]
+        ## ── end PATCH ──
 
-        # topology
         self.edge_list = [adj_list_to_edges(self.adj_list)]
         self.mapping_list = []
 
-        # network
         self.layers = nn.ModuleList()
         for i in range(opt.n_layers):
             layers = []
@@ -166,7 +206,8 @@ class STConvEncoder(nn.Module):
                 dropout=opt.dropout
             ))
 
-            pool = STPool(opt.dataset_name, i)
+            pool = STPool(opt.dataset_name, i,
+                          skeleton_mode=getattr(opt, 'skeleton_mode', '7part'))
             layers.append(pool)
             self.layers.append(nn.Sequential(*layers))
 
@@ -183,20 +224,13 @@ class STConvDecoder(nn.Module):
     def __init__(self, opt, encoder: STConvEncoder):
         super(STConvDecoder, self).__init__()
 
-        # network modules
         self.layers = nn.ModuleList()
-
-        # build network
         mapping_list = encoder.mapping_list.copy()
         edge_list = encoder.edge_list.copy()
 
         for i in range(opt.n_layers):
             layers = []
-
-            # unpooling
             layers.append(STUnpool(skeleton_mapping=mapping_list.pop()))
-
-            # conv
             edges = edge_list.pop()
             for _ in range(opt.n_extra_layers):
                 layers.append(ResSTConv(
@@ -215,14 +249,9 @@ class STConvDecoder(nn.Module):
                 norm=opt.norm,
                 dropout=opt.dropout
             ))
-
             self.layers.append(nn.Sequential(*layers))
 
     def forward(self, x):
-        """
-        x: [B, T, J_in, D]
-        out: [B, T, J_out, D]
-        """
         for layer in self.layers:
             x = layer(x)
         return x

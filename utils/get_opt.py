@@ -1,13 +1,31 @@
 import os
+from os.path import join as pjoin
 from argparse import Namespace
 import re
-from os.path import join as pjoin
-from utils.word_vectorizer import POS_enumerator
+
+
+POS_enumerator = {
+    'VERB': 0,
+    'NOUN': 1,
+    'DET': 2,
+    'ADP': 3,
+    'NUM': 4,
+    'AUX': 5,
+    'PRON': 6,
+    'ADJ': 7,
+    'ADV': 8,
+    'Loc_VIP': 9,
+    'Body_VIP': 10,
+    'Obj_VIP': 11,
+    'Act_VIP': 12,
+    'Desc_VIP': 13,
+    'OTHER': 14,
+}
 
 
 def is_float(numStr):
     flag = False
-    numStr = str(numStr).strip().lstrip('-').lstrip('+')    # 去除正数(+)、负数(-)符号
+    numStr = str(numStr).strip().lstrip('-').lstrip('+')
     try:
         reg = re.compile(r'^[-+]?[0-9]+\.[0-9]+$')
         res = reg.match(str(numStr))
@@ -20,7 +38,7 @@ def is_float(numStr):
 
 def is_number(numStr):
     flag = False
-    numStr = str(numStr).strip().lstrip('-').lstrip('+')    # 去除正数(+)、负数(-)符号
+    numStr = str(numStr).strip().lstrip('-').lstrip('+')
     if str(numStr).isdigit():
         flag = True
     return flag
@@ -45,11 +63,9 @@ def get_opt(opt_path, device, **kwargs):
     with open(opt_path, 'r') as f:
         for line in f:
             if line.strip() not in skip:
-                # print(line.strip())
                 key, value = line.strip('\n').split(': ')
                 if value in ('True', 'False'):
                     opt_dict[key] = (value == 'True')
-                #     print(key, value)
                 elif is_float(value):
                     opt_dict[key] = float(value)
                 elif is_number(value):
@@ -59,7 +75,6 @@ def get_opt(opt_path, device, **kwargs):
                 else:
                     opt_dict[key] = str(value)
 
-    # print(opt)
     opt_dict['which_epoch'] = 'finest'
     opt.save_root = pjoin(opt.checkpoints_dir, opt.dataset_name, opt.name)
     opt.model_dir = pjoin(opt.save_root, 'model')
@@ -87,8 +102,19 @@ def get_opt(opt_path, device, **kwargs):
         opt.max_motion_length = 196
         opt.max_motion_frame = 196
         opt.max_motion_token = 55
+    ## ── PATCH: sign ──
+    elif opt.dataset_name == 'sign':
+        opt.joints_num = 7
+        opt.pose_dim = 133
+        opt.contact_joints = []
+        opt.fps = 24
+        opt.max_motion_length = getattr(opt, 'max_motion_length', 400)
+        opt.max_motion_frame = opt.max_motion_length
+        opt.max_motion_token = 55
+    ## ── end PATCH ──
     else:
         raise KeyError('Dataset not recognized')
+
     if not hasattr(opt, 'unit_length'):
         opt.unit_length = 4
     opt.dim_word = 300
@@ -98,6 +124,6 @@ def get_opt(opt_path, device, **kwargs):
     opt.is_continue = False
     opt.device = device
 
-    opt_dict.update(kwargs) # Overwrite with kwargs params
+    opt_dict.update(kwargs)
 
     return opt

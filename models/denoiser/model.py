@@ -7,7 +7,7 @@ from typing import List
 import torch
 import torch.nn as nn
 
-from models.denoiser.clip import FrozenCLIPTextEncoder
+from models.denoiser.clip import build_text_encoder, get_text_encoder_dim
 from models.denoiser.embedding import TimestepEmbedding, PositionalEmbedding
 from models.denoiser.transformer import SkipTransformer
 
@@ -42,7 +42,10 @@ class Denoiser(nn.Module):
 
         self.opt = opt
         self.latent_dim = opt.latent_dim
-        self.clip_dim = 512 if opt.clip_version == "ViT-B/32" else 768 # ViT-L/14
+
+        ## ── PATCH: use factory for text encoder (CLIP or XLM-R) ──
+        self.clip_dim = get_text_encoder_dim(opt)
+        ## ── end PATCH ──
 
         # input & output process
         self.input_process = InputProcess(opt, vae_dim)
@@ -51,8 +54,9 @@ class Denoiser(nn.Module):
         # timestep embedding
         self.timestep_emb = TimestepEmbedding(self.latent_dim)
 
-        # CLIP text encoder
-        self.clip_model = FrozenCLIPTextEncoder(opt)
+        ## ── PATCH: build text encoder via factory ──
+        self.clip_model = build_text_encoder(opt)
+        ## ── end PATCH ──
         self.word_emb = nn.Linear(self.clip_dim, self.latent_dim)
         
         # positional embedding
@@ -61,7 +65,7 @@ class Denoiser(nn.Module):
         # transformer
         self.transformer = SkipTransformer(opt)
 
-        # cache for CLIP embedding
+        # cache for text embedding
         self._cache_word_emb = None
         self._cache_ca_mask = None
         self._cache_tokens_pos = None
@@ -81,12 +85,13 @@ class Denoiser(nn.Module):
         self._cache_ca_mask = None
         self._cache_tokens_pos = None
 
-    def forward(self, x, timestep_emb, text, len_mask=None, need_attn=False,
+    def forward(self, x, timestep_emb, text=None, text_emb=None, len_mask=None, need_attn=False,
                 fixed_sa=None, fixed_ta=None, fixed_ca=None, use_cached_clip=False):
         """
         sample: [B, T, J, D]
         timestep: [B,] or [1,]
-        lengths: [B,]
+        text: list of str (raw text) — used when text_emb is None
+        text_emb: (word_emb[B,T,D], attn_mask[B,T], token_pos[B]) — precomputed, skip encoder
         """
 
         # input process
@@ -96,8 +101,14 @@ class Denoiser(nn.Module):
         # diffusion timestep embedding
         timestep_emb = self.timestep_emb(timestep_emb).expand(B, D)
 
-        # text embedding
-        if use_cached_clip and all([e is not None for e in [self._cache_word_emb, self._cache_ca_mask, self._cache_tokens_pos]]):
+        # text embedding — 3 sources: text_emb (precomputed) > clip cache > encode_text
+        if text_emb is not None:
+            word_emb, ca_mask, token_pos = text_emb
+            word_emb = word_emb.to(x.device)
+            ca_mask = ca_mask.to(x.device)
+            token_pos = token_pos.to(x.device)
+            word_emb = self.word_emb(word_emb)
+        elif use_cached_clip and all([e is not None for e in [self._cache_word_emb, self._cache_ca_mask, self._cache_tokens_pos]]):
             word_emb = self._cache_word_emb
             ca_mask = self._cache_ca_mask
             token_pos = self._cache_tokens_pos
@@ -116,13 +127,6 @@ class Denoiser(nn.Module):
 
         # attention masks
         if len_mask is not None:
-            # # [B, T] -> [B, T*J]
-            # if self.opt.flat_attn:
-            #     ones = (1,) * len_mask.dim()
-            #     len_mask = len_mask[..., None].repeat(*ones, J).reshape(B, -1)
-            #     if self.opt.no_cross_attn:
-            #         len_mask = torch.cat([len_mask[:, :1], len_mask], dim=1)
-            # else:
             # [B, T] -> [B*J, T]
             len_mask = len_mask.repeat_interleave(J, dim=0)
 

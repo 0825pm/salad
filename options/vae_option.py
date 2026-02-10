@@ -13,7 +13,7 @@ def arg_parse(is_train=False):
     parser.add_argument("--gpu_id", type=int, default=0, help="GPU id")
 
     ## dataloader
-    parser.add_argument("--dataset_name", type=str, default="t2m", help="dataset directory", choices=["t2m", "kit"])
+    parser.add_argument("--dataset_name", type=str, default="t2m", help="dataset directory", choices=["t2m", "kit", "sign"])  ## PATCH: added "sign"
     parser.add_argument("--batch_size", default=256, type=int, help="batch size")
     parser.add_argument("--window_size", type=int, default=64, help="training motion length")
     parser.add_argument("--num_workers", type=int, default=4, help="number of workers for dataloader")
@@ -28,9 +28,10 @@ def arg_parse(is_train=False):
 
     parser.add_argument("--recon_loss", type=str, default="l1_smooth", help="reconstruction loss")
     parser.add_argument("--lambda_recon", type=float, default=1.0, help="reconstruction loss weight")
-    parser.add_argument("--lambda_pos", type=float, default=0.5, help="position loss weight")
+    parser.add_argument("--lambda_pos", type=float, default=0.5, help="position/hand loss weight")
     parser.add_argument("--lambda_vel", type=float, default=0.5, help="velocity loss weight")
-    parser.add_argument("--lambda_kl", type=float, default=0.02, help="kl loss weight") # used when vae
+    parser.add_argument("--lambda_kl", type=float, default=0.02, help="kl loss weight")
+    parser.add_argument("--kl_anneal_iters", type=int, default=2000, help="linearly ramp KL weight from 0 to lambda_kl over this many iters (0=no annealing)")
 
     ## vae arch
     parser.add_argument("--latent_dim", type=int, default=32, help="embedding dimension")
@@ -41,6 +42,19 @@ def arg_parse(is_train=False):
     parser.add_argument("--activation", type=str, default="gelu", help="activation function", choices=["relu", "silu", "gelu"])
     parser.add_argument("--dropout", type=float, default=0.1, help="dropout rate")
     
+    ## sign-specific options  ## PATCH
+    parser.add_argument("--sign_dataset", type=str, default="how2sign",
+                        help="which sign datasets to use (combine with underscore)",
+                        choices=["how2sign", "csl", "how2sign_csl", "how2sign_csl_phoenix"])
+    parser.add_argument("--skeleton_mode", type=str, default="7part",
+                        choices=["7part", "finger"],
+                        help="sign skeleton grouping: 7part(default) or finger(15 tokens)")
+    parser.add_argument("--data_root", type=str, default=None, help="override data_root (for sign)")
+    parser.add_argument("--csl_root", type=str, default=None, help="CSL-Daily data root")
+    parser.add_argument("--phoenix_root", type=str, default=None, help="Phoenix-2014T data root")
+    parser.add_argument("--mean_path", type=str, default=None, help="path to mean.pt (179D)")
+    parser.add_argument("--std_path", type=str, default=None, help="path to std.pt (179D)")
+
     ## other
     parser.add_argument("--is_continue", action="store_true", help="Name of this trial")
     parser.add_argument("--checkpoints_dir", type=str, default="./checkpoints", help="models are saved here")
@@ -65,21 +79,21 @@ def arg_parse(is_train=False):
 
     args = vars(opt)
 
-    # non-saved options
+    # ── dataset-specific config ──
     if opt.dataset_name == "t2m":
-        opt.data_root = './dataset/humanml3d/'
+        opt.data_root = opt.data_root or './dataset/humanml3d/'
         opt.motion_dir = pjoin(opt.data_root, 'new_joint_vecs')
         opt.text_dir = pjoin(opt.data_root, 'texts')
         opt.joints_num = 22
         opt.pose_dim = 263
-        opt.contact_joints = [7, 10, 8, 11] # left foot, left toe, right foot, right toe
+        opt.contact_joints = [7, 10, 8, 11]
         opt.fps = 20
         opt.radius = 4
         opt.kinematic_chain = paramUtil.t2m_kinematic_chain
         opt.dataset_opt_path = './checkpoints/t2m/Comp_v6_KLD005/opt.txt'
 
     elif opt.dataset_name == "kit":
-        opt.data_root = './dataset/kit-ml/'
+        opt.data_root = opt.data_root or './dataset/kit-ml/'
         opt.motion_dir = pjoin(opt.data_root, 'new_joint_vecs')
         opt.text_dir = pjoin(opt.data_root, 'texts')
         opt.joints_num = 21
@@ -89,6 +103,23 @@ def arg_parse(is_train=False):
         opt.radius = 240 * 8
         opt.kinematic_chain = paramUtil.kit_kinematic_chain
         opt.dataset_opt_path = './checkpoints/kit/Comp_v6_KLD005/opt.txt'
+
+    ## ── PATCH: sign language ──
+    elif opt.dataset_name == "sign":
+        from utils.sign_paramUtil import get_sign_config
+        _, _, _, num_j = get_sign_config(opt.skeleton_mode)
+        opt.data_root = opt.data_root or './dataset/how2sign/'
+        opt.joints_num = num_j   # 7 (7part) or 15 (finger)
+        opt.pose_dim = 133
+        opt.contact_joints = []  # no foot contact in sign
+        opt.fps = 24
+        opt.radius = 2
+        opt.kinematic_chain = None
+        opt.dataset_opt_path = None  # no HumanML3D evaluator for sign
+        opt.unit_length = 4
+        opt.min_motion_length = 40
+        opt.max_motion_length = 400
+    ## ── end PATCH ──
     else:
         raise KeyError('Dataset Does not Exists')
     
@@ -98,7 +129,6 @@ def arg_parse(is_train=False):
     print('-------------- End ----------------')
     opt.is_train = is_train
     if is_train:
-    # save to the disk
         expr_dir = os.path.join(opt.checkpoints_dir, opt.dataset_name, opt.name)
         if not os.path.exists(expr_dir):
             os.makedirs(expr_dir)

@@ -36,23 +36,48 @@ class DenoiserTrainer:
         if opt.is_train:
             self.logger = SummaryWriter(opt.log_dir)
             if opt.recon_loss == "l1":
-                self.recon_criterion = torch.nn.L1Loss()
+                self.recon_criterion = torch.nn.L1Loss(reduction='none')
             elif opt.recon_loss == "l1_smooth":
-                self.recon_criterion = torch.nn.SmoothL1Loss()
+                self.recon_criterion = torch.nn.SmoothL1Loss(reduction='none')
             elif opt.recon_loss == "l2":
-                self.recon_criterion = torch.nn.MSELoss()
+                self.recon_criterion = torch.nn.MSELoss(reduction='none')
             else:
                 raise NotImplementedError(f"Reconstruction loss {opt.recon_loss} not implemented")
+
+            # Part-weight: dynamic based on skeleton_mode
+            hw = getattr(opt, 'hand_weight', 1.0)
+            skeleton_mode = getattr(opt, 'skeleton_mode', '7part')
+            from utils.sign_paramUtil import get_sign_config
+            _, _, hand_idx, num_j = get_sign_config(skeleton_mode)
+            self.part_weight = torch.ones(num_j, device=opt.device)
+            for idx in hand_idx:
+                self.part_weight[idx] = hw
+            self.part_weight = self.part_weight / self.part_weight.mean()  # normalize so avg=1
+            if hw != 1.0:
+                print(f"  [Loss] hand_weight={hw}, skeleton_mode={skeleton_mode} → part_weight={self.part_weight.tolist()}")
+
+            # AMP (mixed precision)
+            self.use_amp = getattr(opt, 'use_amp', False)
+            self.scaler = torch.cuda.amp.GradScaler(enabled=self.use_amp)
+            if self.use_amp:
+                print("  [AMP] Mixed precision training enabled (bf16)")
             
     
     def train_forward(self, batch_data):
         # setup input
-        text, motion, m_lens = batch_data
+        text_or_emb, motion, m_lens = batch_data
 
-        # random drop during training
-        text = [
-            "" if np.random.rand(1) < self.opt.cond_drop_prob else t for t in text
-        ]
+        # detect cache mode: tuple of tensors vs list of strings
+        if isinstance(text_or_emb, (tuple, list)) and len(text_or_emb) == 3 and torch.is_tensor(text_or_emb[0]):
+            # Cached text embeddings — CFG dropout already handled by dataset
+            text = None
+            text_emb = tuple(t.to(self.opt.device) for t in text_or_emb)
+        else:
+            # Raw text strings — apply CFG dropout here
+            text = [
+                "" if np.random.rand(1) < self.opt.cond_drop_prob else t for t in text_or_emb
+            ]
+            text_emb = None
 
         # to device
         motion = motion.to(self.opt.device, dtype=torch.float32)
@@ -78,33 +103,37 @@ class DenoiserTrainer:
         noise = noise * len_mask[..., None, None].float()
         noisy_latent = self.noise_scheduler.add_noise(latent, noise, timesteps)
 
-        # predict the noise
-        pred, attn_list = self.denoiser.forward(noisy_latent, timesteps, text, len_mask=len_mask)
-        pred = pred * len_mask[..., None, None].float()
-        
-        # loss
-        loss_dict = {}
-        loss = 0
-        if self.opt.prediction_type == "sample":
-            loss_sample = self.recon_criterion(pred, latent)
-            loss += loss_sample
-            loss_dict["loss_sample"] = loss_sample
-
-        elif self.opt.prediction_type == "epsilon":
-            loss_eps = self.recon_criterion(pred, noise)
-            loss += loss_eps
-            loss_dict["loss_eps"] = loss_eps
-
-        elif self.opt.prediction_type == "v_prediction":
-            vel = self.noise_scheduler.get_velocity(latent, noise, timesteps)
-            loss_vel = self.recon_criterion(pred, vel)
-            loss += loss_vel
-            loss_dict["loss_vel"] = loss_vel
+        # predict the noise (AMP autocast)
+        with torch.cuda.amp.autocast(dtype=torch.bfloat16, enabled=self.use_amp):
+            pred, attn_list = self.denoiser.forward(noisy_latent, timesteps, text=text, text_emb=text_emb, len_mask=len_mask)
+            pred = pred * len_mask[..., None, None].float()
             
-        else:
-            raise NotImplementedError(f"Prediction type {self.opt.prediction_type} not implemented")
-            
-        loss_dict["loss"] = loss
+            # loss (part-weighted: hands get higher weight)
+            loss_dict = {}
+            loss = 0
+            if self.opt.prediction_type == "sample":
+                raw = self.recon_criterion(pred, latent)  # [B, T, J, D]
+                loss_sample = (raw * self.part_weight[None, None, :, None]).mean()
+                loss += loss_sample
+                loss_dict["loss_sample"] = loss_sample
+
+            elif self.opt.prediction_type == "epsilon":
+                raw = self.recon_criterion(pred, noise)
+                loss_eps = (raw * self.part_weight[None, None, :, None]).mean()
+                loss += loss_eps
+                loss_dict["loss_eps"] = loss_eps
+
+            elif self.opt.prediction_type == "v_prediction":
+                vel = self.noise_scheduler.get_velocity(latent, noise, timesteps)
+                raw = self.recon_criterion(pred, vel)  # [B, T, J, D]
+                loss_vel = (raw * self.part_weight[None, None, :, None]).mean()
+                loss += loss_vel
+                loss_dict["loss_vel"] = loss_vel
+                
+            else:
+                raise NotImplementedError(f"Prediction type {self.opt.prediction_type} not implemented")
+                
+            loss_dict["loss"] = loss
 
         return loss, attn_list, loss_dict
     
@@ -114,7 +143,15 @@ class DenoiserTrainer:
         self.denoiser.eval()
 
         # setup input
-        text, motion, m_lens = batch_data
+        text_or_emb, motion, m_lens = batch_data
+
+        # generate always uses text strings (eval datasets should not use cache)
+        if isinstance(text_or_emb, (tuple, list)) and len(text_or_emb) == 3 and torch.is_tensor(text_or_emb[0]):
+            raise ValueError(
+                "generate() requires text strings, not cached embeddings. "
+                "Set use_text_cache=False for eval/val datasets."
+            )
+        text = text_or_emb
 
         # to device
         motion = motion.to(self.opt.device, dtype=torch.float32)
@@ -147,7 +184,7 @@ class DenoiserTrainer:
                 input_latents = latents
                 input_len_mask = len_mask
             
-            pred, attn = self.denoiser.forward(input_latents, timestep, input_text,
+            pred, attn = self.denoiser.forward(input_latents, timestep, text=input_text,
                                                len_mask=input_len_mask, need_attn=need_attn, use_cached_clip=True)
 
             # classifier-free guidance
@@ -171,9 +208,12 @@ class DenoiserTrainer:
 
         # stack attention weights
         if need_attn:
-            skel_attn_weights = torch.stack(skel_attn_weights, dim=1) # [bsz * nframes, ntimesteps, nlayers, nheads, njoints, njoints]
-            temp_attn_weights = torch.stack(temp_attn_weights, dim=1) # [bsz * njoints, ntimesteps, nlayers, nheads, nframes, nframes]
-            cross_attn_weights = torch.stack(cross_attn_weights, dim=1) # [bsz, ntimesteps, nlayers, nheads, nframes * njoints, dclip]
+            def _safe_stack(wlist):
+                valid = [w for w in wlist if w is not None]
+                return torch.stack(valid, dim=1) if valid else None
+            skel_attn_weights = _safe_stack(skel_attn_weights)
+            temp_attn_weights = _safe_stack(temp_attn_weights)
+            cross_attn_weights = _safe_stack(cross_attn_weights)
             attn_weights = (skel_attn_weights, temp_attn_weights, cross_attn_weights)
         else:
             attn_weights = (None, None, None)
@@ -197,6 +237,7 @@ class DenoiserTrainer:
             "denoiser": self.denoiser.state_dict_without_clip(),
             "optim": self.optim.state_dict(),
             "lr_scheduler": self.lr_scheduler.state_dict(),
+            "scaler": self.scaler.state_dict(),
             "epoch": epoch,
             "total_iter": total_iter,
         }
@@ -212,6 +253,8 @@ class DenoiserTrainer:
         try:
             self.optim.load_state_dict(checkpoint["optim"])
             self.lr_scheduler.load_state_dict(checkpoint["lr_scheduler"])
+            if "scaler" in checkpoint:
+                self.scaler.load_state_dict(checkpoint["scaler"])
         except:
             print("Fail to load optimizer and lr_scheduler")
         return checkpoint["epoch"], checkpoint["total_iter"]
@@ -223,7 +266,15 @@ class DenoiserTrainer:
 
         # optimizer
         self.optim = torch.optim.AdamW(self.denoiser.parameters(), lr=self.opt.lr, betas=(0.9, 0.99), weight_decay=self.opt.weight_decay)
-        self.lr_scheduler = torch.optim.lr_scheduler.MultiStepLR(self.optim, milestones=self.opt.milestones, gamma=self.opt.gamma)
+        total_iters = self.opt.max_epoch * len(train_loader)
+        if getattr(self.opt, 'lr_schedule', 'multistep') == 'cosine':
+            eta_min = getattr(self.opt, 'eta_min', 1e-6)
+            self.lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                self.optim, T_max=total_iters - self.opt.warm_up_iter, eta_min=eta_min)
+            print(f"Using CosineAnnealingLR (T_max={total_iters - self.opt.warm_up_iter}, eta_min={eta_min})")
+        else:
+            self.lr_scheduler = torch.optim.lr_scheduler.MultiStepLR(self.optim, milestones=self.opt.milestones, gamma=self.opt.gamma)
+            print(f"Using MultiStepLR (milestones={self.opt.milestones}, gamma={self.opt.gamma})")
 
         epoch = 0
         it = 0
@@ -233,18 +284,18 @@ class DenoiserTrainer:
             print("Load model epoch:%d iterations:%d"%(epoch, it))
 
         start_time = time.time()
-        total_iters = self.opt.max_epoch * len(train_loader)
         print(f"Total Epochs: {self.opt.max_epoch}, Total Iters: {total_iters}")
-        print(f"Iters Per Epoch, Training: {len(train_loader)}, Validation: {len(eval_val_loader)}")
+        print(f"Iters Per Epoch, Training: {len(train_loader)}, Validation: {len(eval_val_loader) if eval_val_loader else 'N/A'}")
         logs = defaultdict(def_value, OrderedDict())
 
         # eval
         best_fid, best_div, best_top1, best_top2, best_top3, best_matching = 1000, 100, 0, 0, 0, 100
-        best_fid, best_div, best_top1, best_top2, best_top3, best_matching, writer, gt_motion, gen_motion, m_length, cond_list = evaluation_denoiser(
-            self.opt.model_dir, eval_val_loader, self.denoiser, self.generate, self.logger, epoch,
-            best_fid=best_fid, best_div=best_div, best_top1=best_top1, best_top2=best_top2, best_top3=best_top3, best_matching=best_matching,
-            eval_wrapper=eval_wrapper, save=True, draw=True, device=self.opt.device
-        )
+        if eval_val_loader is not None and eval_wrapper is not None:
+            best_fid, best_div, best_top1, best_top2, best_top3, best_matching, writer, gt_motion, gen_motion, m_length, cond_list = evaluation_denoiser(
+                self.opt.model_dir, eval_val_loader, self.denoiser, self.generate, self.logger, epoch,
+                best_fid=best_fid, best_div=best_div, best_top1=best_top1, best_top2=best_top2, best_top3=best_top3, best_matching=best_matching,
+                eval_wrapper=eval_wrapper, save=True, draw=True, device=self.opt.device
+            )
         # else:
         # best_fid, best_div, best_top1, best_top2, best_top3, best_matching = 1000, 100, 0, 0, 0, 100
 
@@ -260,8 +311,9 @@ class DenoiserTrainer:
                 # forward
                 loss, attn_list, loss_dict = self.train_forward(batch_data)
                 self.optim.zero_grad()
-                loss.backward()
-                self.optim.step()
+                self.scaler.scale(loss).backward()
+                self.scaler.step(self.optim)
+                self.scaler.update()
 
                 if it >= self.opt.warm_up_iter:
                     self.lr_scheduler.step()
@@ -302,18 +354,23 @@ class DenoiserTrainer:
             
             # evaluation
             if epoch % self.opt.eval_every_e == 0:
-                best_fid, best_div, best_top1, best_top2, best_top3, best_matching, writer, gt_motion, gen_motion, m_length, cond_list = evaluation_denoiser(
-                    self.opt.model_dir, eval_val_loader, self.denoiser, self.generate, self.logger, epoch,
-                    best_fid=best_fid, best_div=best_div, best_top1=best_top1, best_top2=best_top2, best_top3=best_top3, best_matching=best_matching,
-                    eval_wrapper=eval_wrapper, save=True, draw=True, device=self.opt.device
-                )
+                if eval_val_loader is not None and eval_wrapper is not None:
+                    best_fid, best_div, best_top1, best_top2, best_top3, best_matching, writer, gt_motion, gen_motion, m_length, cond_list = evaluation_denoiser(
+                        self.opt.model_dir, eval_val_loader, self.denoiser, self.generate, self.logger, epoch,
+                        best_fid=best_fid, best_div=best_div, best_top1=best_top1, best_top2=best_top2, best_top3=best_top3, best_matching=best_matching,
+                        eval_wrapper=eval_wrapper, save=True, draw=True, device=self.opt.device
+                    )
 
-                data = np.concatenate([gt_motion[:4], gen_motion[:4]], axis=0)
-                length = np.concatenate([m_length[:4], m_length[:4]], axis=0)
-                cond_list = cond_list[:4] + cond_list[:4]
-                save_dir = pjoin(self.opt.eval_dir, "E%04d" % (epoch))
-                os.makedirs(save_dir, exist_ok=True)
-                plot_eval(data, save_dir, cond_list, length)
+                    data = np.concatenate([gt_motion[:4], gen_motion[:4]], axis=0)
+                    length = np.concatenate([m_length[:4], m_length[:4]], axis=0)
+                    cond_list = cond_list[:4] + cond_list[:4]
+                    save_dir = pjoin(self.opt.eval_dir, "E%04d" % (epoch))
+                    os.makedirs(save_dir, exist_ok=True)
+                    plot_eval(data, save_dir, cond_list, length)
+                else:
+                    # sign: no eval_wrapper, save checkpoint periodically
+                    val_loss = val_log.get("loss", 0) / max(len(val_loader), 1)
+                    self.save(pjoin(self.opt.model_dir, f'net_epoch{epoch:03d}_loss{val_loss:.4f}.tar'), epoch, it)
     
     
     @torch.no_grad()

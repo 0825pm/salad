@@ -14,7 +14,7 @@ def arg_parse(is_train=False):
     parser.add_argument("--gpu_id", type=int, default=0, help="GPU id")
 
     ## dataloader
-    parser.add_argument("--dataset_name", type=str, default="t2m", help="dataset directory", choices=["t2m", "kit"])
+    parser.add_argument("--dataset_name", type=str, default="t2m", help="dataset directory", choices=["t2m", "kit", "sign"])  ## PATCH
     parser.add_argument("--batch_size", default=64, type=int, help="batch size")
     parser.add_argument("--max_motion_length", type=int, default=196, help="Max length of motion")
     parser.add_argument("--unit_length", type=int, default=4, help="Downscale ratio of VAE")
@@ -26,14 +26,28 @@ def arg_parse(is_train=False):
     parser.add_argument("--lr", default=5e-4, type=float, help="max learning rate")
     parser.add_argument("--milestones", default=[50_000], nargs="+", type=int, help="learning rate schedule (iterations)")
     parser.add_argument("--gamma", default=0.1, type=float, help="learning rate decay")
+    parser.add_argument("--lr_schedule", default="multistep", type=str, choices=["multistep", "cosine"], help="lr scheduler type")
+    parser.add_argument("--eta_min", default=1e-6, type=float, help="min lr for cosine annealing")
     parser.add_argument("--weight_decay", default=1e-6, type=float, help="weight decay")
     parser.add_argument("--recon_loss", type=str, default="l2", help="reconstruction loss", choices=["l1", "l1_smooth", "l2"])
 
-    ## denosier arch
-    parser.add_argument("--clip_version", type=str, default="ViT-B/32", choices=["ViT-B/32", "ViT-L/14"], help="CLIP version")
+    ## denoiser arch
+    parser.add_argument("--text_encoder", type=str, default="clip",
+                        choices=["clip", "xlm-roberta"],
+                        help="Text encoder: 'clip' (English) or 'xlm-roberta' (multilingual)")
+    parser.add_argument("--clip_version", type=str, default="ViT-B/32", choices=["ViT-B/32", "ViT-L/14"], help="CLIP version (used when text_encoder=clip)")
+    parser.add_argument("--xlmr_version", type=str, default="xlm-roberta-base",
+                        choices=["xlm-roberta-base", "xlm-roberta-large"],
+                        help="XLM-RoBERTa version (used when text_encoder=xlm-roberta)")
     parser.add_argument("--latent_dim", type=int, default=256, help="embedding dimension")
     parser.add_argument("--n_heads", type=int, default=8, help="Number of heads")
     parser.add_argument("--n_layers", type=int, default=5, help="num of layers")
+    parser.add_argument("--use_limm", action="store_true",
+                        help="Replace temporal attention with LIMM (1D conv) in input blocks")
+    parser.add_argument("--use_atii", action="store_true",
+                        help="Replace cross attention with ATII (channel gating) in input blocks")
+    parser.add_argument("--hand_weight", type=float, default=1.0,
+                        help="Loss weight multiplier for hand parts (index 3,4). e.g. 5.0 = 5x weight on hands")
     parser.add_argument("--kernel_size", type=int, default=3, help="kernel size")
     parser.add_argument("--ff_dim", type=int, default=1024, help="feedforward dimension")
     parser.add_argument("--norm", type=str, default="layer", help="normalization", choices=["none", "batch", "layer"])
@@ -41,12 +55,8 @@ def arg_parse(is_train=False):
     parser.add_argument("--dropout", type=float, default=0.1, help="dropout rate")
     parser.add_argument("--cond_drop_prob", type=float, default=0.1, help="Dropout ratio of condition for classifier-free guidance")
     parser.add_argument("--cond_scale", type=float, default=7.5, help="classifier-free guidance scale factor for condition")
-    
-    # parser.add_argument("--additive_attn", action="store_true", help="Use additive attention of skeletal and temporal dimensions")
-    # parser.add_argument("--skel_attn_first", action="store_true", help="Use skeletal attention first")
-    # parser.add_argument("--flat_attn", action="store_true", help="Use flat attention for skeletal and temporal dimensions")
-    # parser.add_argument("--no_cross_attn", action="store_true", help="Use cross attention for skeletal and temporal dimensions")
-    # parser.add_argument("--no_film", action="store_true", help="Not using FiLM for conditioning and use element-wise addition instead")
+    parser.add_argument("--use_amp", action="store_true",
+                        help="Use automatic mixed precision (bf16) for faster training")
 
     ## diffusion scheduler
     parser.add_argument("--num_train_timesteps", type=int, default=1000, help="Number of training timesteps")
@@ -55,6 +65,20 @@ def arg_parse(is_train=False):
     parser.add_argument("--beta_end", type=float, default=0.012, help="Beta end")
     parser.add_argument("--beta_schedule", type=str, default="scaled_linear", help="Beta schedule", choices=["linear", "scaled_linear", "squaredcos_cap_v2"])
     parser.add_argument("--prediction_type", type=str, default="v_prediction", help="Prediction type", choices=["epsilon", "sample", "v_prediction"])
+
+    ## sign-specific options  ## PATCH
+    parser.add_argument("--sign_dataset", type=str, default="how2sign",
+                        choices=["how2sign", "csl", "how2sign_csl", "how2sign_csl_phoenix"])
+    parser.add_argument("--skeleton_mode", type=str, default="7part",
+                        choices=["7part", "finger"],
+                        help="sign skeleton grouping: 7part(default) or finger(15 tokens)")
+    parser.add_argument("--data_root", type=str, default=None)
+    parser.add_argument("--csl_root", type=str, default=None)
+    parser.add_argument("--phoenix_root", type=str, default=None)
+    parser.add_argument("--mean_path", type=str, default=None)
+    parser.add_argument("--std_path", type=str, default=None)
+    parser.add_argument("--use_text_cache", action="store_true",
+                        help="Use precomputed text embeddings (run cache_text_embeddings.py first)")
 
     ## log
     parser.add_argument("--is_continue", action="store_true", help="Name of this trial")
@@ -78,7 +102,7 @@ def arg_parse(is_train=False):
     os.makedirs(opt.log_dir, exist_ok=True)
 
     if opt.dataset_name == "t2m":
-        opt.data_root = './dataset/humanml3d/'
+        opt.data_root = opt.data_root or './dataset/humanml3d/'
         opt.motion_dir = pjoin(opt.data_root, 'new_joint_vecs')
         opt.text_dir = pjoin(opt.data_root, 'texts')
         opt.joints_num = 22
@@ -90,7 +114,7 @@ def arg_parse(is_train=False):
         opt.dataset_opt_path = './checkpoints/t2m/Comp_v6_KLD005/opt.txt'
 
     elif opt.dataset_name == "kit":
-        opt.data_root = './dataset/kit-ml/'
+        opt.data_root = opt.data_root or './dataset/kit-ml/'
         opt.motion_dir = pjoin(opt.data_root, 'new_joint_vecs')
         opt.text_dir = pjoin(opt.data_root, 'texts')
         opt.joints_num = 21
@@ -100,10 +124,25 @@ def arg_parse(is_train=False):
         opt.radius = 240 * 8
         opt.kinematic_chain = paramUtil.kit_kinematic_chain
         opt.dataset_opt_path = './checkpoints/kit/Comp_v6_KLD005/opt.txt'
+
+    ## ── PATCH: sign ──
+    elif opt.dataset_name == "sign":
+        from utils.sign_paramUtil import get_sign_config
+        _, _, _, num_j = get_sign_config(opt.skeleton_mode)
+        opt.data_root = opt.data_root or './dataset/how2sign/'
+        opt.joints_num = num_j   # 7 (7part) or 15 (finger)
+        opt.pose_dim = 133
+        opt.contact_joints = []
+        opt.fps = 24
+        opt.radius = 2
+        opt.kinematic_chain = None
+        opt.dataset_opt_path = None
+        opt.min_motion_length = 40
+    ## ── end PATCH ──
     else:
         raise KeyError('Dataset Does not Exists')
     
-    opt.text_dir = pjoin(opt.data_root, 'texts')
+    opt.text_dir = pjoin(opt.data_root, 'texts') if opt.dataset_name != 'sign' else None
 
     args = vars(opt)
 
@@ -114,7 +153,6 @@ def arg_parse(is_train=False):
             print('%s: %s' % (str(k), str(v)))
         print('-------------- End ----------------')
         
-        # save to the disk
         expr_dir = os.path.join(opt.checkpoints_dir, opt.dataset_name, opt.name)
         if not os.path.exists(expr_dir):
             os.makedirs(expr_dir)

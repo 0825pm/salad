@@ -112,6 +112,87 @@ class MultiheadAttention(nn.Module):
         return attn_output, attn_weights
 
 
+# ═══════════════════════════════════════════════════════════════
+#  LIMM: Local Information Modeling Module (Light-T2M, AAAI 2025)
+#  Replaces Temporal Attention with lightweight 1D convolutions
+# ═══════════════════════════════════════════════════════════════
+
+class LIMM(nn.Module):
+    """
+    Pointwise Conv → Depthwise Conv (local kernel) → Pointwise Conv + residual.
+    Operates on the temporal axis: input [B, T, D] → output [B, T, D].
+    """
+    def __init__(self, dim, kernel_size=7, dropout=0.1):
+        super().__init__()
+        self.norm = nn.LayerNorm(dim)
+        self.pw1 = nn.Conv1d(dim, dim, 1)
+        self.dw  = nn.Conv1d(dim, dim, kernel_size, padding=kernel_size // 2, groups=dim)
+        self.pw2 = nn.Conv1d(dim, dim, 1)
+        self.act = nn.GELU()
+        self.drop = nn.Dropout(dropout)
+
+    def forward(self, x):
+        """x: [B, T, D]"""
+        res = x
+        x = self.norm(x).transpose(1, 2)   # [B, D, T]
+        x = self.act(self.pw1(x))
+        x = self.act(self.dw(x))
+        x = self.pw2(x).transpose(1, 2)    # [B, T, D]
+        x = self.drop(x)
+        return x + res
+
+
+# ═══════════════════════════════════════════════════════════════
+#  ATII: Adaptive Textual Information Injector (Light-T2M, AAAI 2025)
+#  Replaces Cross Attention with channel-wise gating
+# ═══════════════════════════════════════════════════════════════
+
+class ATII(nn.Module):
+    """
+    text_emb → mean pool → MLP → sigmoid → channel gating on motion features.
+    Input: motion [B, T*J, D], text [B, N, D]  →  Output: [B, T*J, D]
+    """
+    def __init__(self, dim, dropout=0.1):
+        super().__init__()
+        self.norm_motion = nn.LayerNorm(dim)
+        self.norm_text = nn.LayerNorm(dim)
+        self.gate_mlp = nn.Sequential(
+            nn.Linear(dim, dim * 2),
+            nn.GELU(),
+            nn.Linear(dim * 2, dim),
+        )
+        self.gate_scale = nn.Parameter(torch.ones(1) * 0.1)
+        self.drop = nn.Dropout(dropout)
+
+    def forward(self, motion, text, text_mask=None):
+        """
+        motion: [B, L, D]  (L = T*J)
+        text:   [B, N, D]
+        text_mask: [B, N] (True = padding → ignore)
+        """
+        text_normed = self.norm_text(text)
+
+        # mean pool over valid text tokens
+        if text_mask is not None:
+            valid = (~text_mask).unsqueeze(-1).float()  # [B, N, 1]
+            text_pooled = (text_normed * valid).sum(dim=1) / valid.sum(dim=1).clamp(min=1)
+        else:
+            text_pooled = text_normed.mean(dim=1)  # [B, D]
+
+        # channel gate
+        gate = torch.sigmoid(self.gate_mlp(text_pooled))  # [B, D]
+        gate = gate.unsqueeze(1)  # [B, 1, D]
+
+        motion_normed = self.norm_motion(motion)
+        out = motion_normed * gate * self.gate_scale
+        out = self.drop(out)
+        return out
+
+
+# ═══════════════════════════════════════════════════════════════
+#  STTransformerLayer: Original full-attention block
+# ═══════════════════════════════════════════════════════════════
+
 class STTransformerLayer(nn.Module):
     """
     Setting
@@ -231,7 +312,150 @@ class STTransformerLayer(nn.Module):
         attn_weights = (sa_weight, ta_weight, ca_weight)
 
         return x, attn_weights
-    
+
+
+# ═══════════════════════════════════════════════════════════════
+#  STTransformerLayerLight: LIMM temporal + ATII text injection
+#  Same forward signature as STTransformerLayer for drop-in use
+# ═══════════════════════════════════════════════════════════════
+
+class STTransformerLayerLight(nn.Module):
+    """
+    Lightweight variant of STTransformerLayer:
+      - Temporal Attention → LIMM (1D conv, local)     [if use_limm]
+      - Cross Attention    → ATII (channel gating)     [if use_atii]
+      - Skeletal Attention → kept (only 7 joints, already cheap)
+      - FFN                → kept
+    """
+    def __init__(self, opt, use_limm=True, use_atii=True):
+        super().__init__()
+        self.opt = opt
+        self.use_limm = use_limm
+        self.use_atii = use_atii
+
+        # ── Skeletal attention (always full — 7 joints is tiny) ──
+        self.skel_attn = MultiheadAttention(opt.latent_dim, opt.n_heads, opt.dropout, batch_first=True)
+        self.skel_norm = nn.LayerNorm(opt.latent_dim)
+        self.skel_dropout = nn.Dropout(opt.dropout)
+
+        # ── Temporal: LIMM or full attention ──
+        if use_limm:
+            self.limm = LIMM(opt.latent_dim, kernel_size=7, dropout=opt.dropout)
+        else:
+            self.temp_attn = MultiheadAttention(opt.latent_dim, opt.n_heads, opt.dropout, batch_first=True)
+            self.temp_norm = nn.LayerNorm(opt.latent_dim)
+            self.temp_dropout = nn.Dropout(opt.dropout)
+
+        # ── Text injection: ATII or full cross attention ──
+        if use_atii:
+            self.atii = ATII(opt.latent_dim, dropout=opt.dropout)
+        else:
+            self.cross_attn = MultiheadAttention(opt.latent_dim, opt.n_heads, opt.dropout, batch_first=True)
+            self.cross_src_norm = nn.LayerNorm(opt.latent_dim)
+            self.cross_tgt_norm = nn.LayerNorm(opt.latent_dim)
+            self.cross_dropout = nn.Dropout(opt.dropout)
+
+        # ── FFN (always full) ──
+        self.ffn_linear1 = nn.Linear(opt.latent_dim, opt.ff_dim)
+        self.ffn_linear2 = nn.Linear(opt.ff_dim, opt.latent_dim)
+        self.ffn_norm = nn.LayerNorm(opt.latent_dim)
+        self.ffn_dropout = nn.Dropout(opt.dropout)
+        self.act = F.relu if opt.activation == "relu" else F.gelu
+
+        # ── FiLM (4 modulations, same structure) ──
+        self.skel_film = DenseFiLM(opt)
+        self.temp_film = DenseFiLM(opt)
+        self.cross_film = DenseFiLM(opt)
+        self.ffn_film = DenseFiLM(opt)
+
+    def _sa_block(self, x, fixed_attn=None):
+        x = self.skel_norm(x)
+        if fixed_attn is None:
+            x, attn = self.skel_attn.forward(x, x, x, need_weights=True, average_attn_weights=False)
+        else:
+            x, attn = self.skel_attn.forward_with_fixed_attn_weights(fixed_attn, x)
+        x = self.skel_dropout(x)
+        return x, attn
+
+    def _ff_block(self, x):
+        x = self.ffn_norm(x)
+        x = self.ffn_linear1(x)
+        x = self.act(x)
+        x = self.ffn_linear2(x)
+        x = self.ffn_dropout(x)
+        return x
+
+    def forward(self, x, memory, cond, x_mask=None, memory_mask=None,
+                skel_attn=None, temp_attn=None, cross_attn=None):
+        """Same signature as STTransformerLayer.forward for drop-in compatibility."""
+
+        B, T, J, D = x.size()
+
+        # FiLM conditions from diffusion timestep
+        skel_cond = self.skel_film(cond)
+        temp_cond = self.temp_film(cond)
+        cross_cond = self.cross_film(cond)
+        ffn_cond = self.ffn_film(cond)
+
+        # ── Temporal ──
+        if self.use_limm:
+            # LIMM: per-joint 1D conv over time axis (LIMM has internal residual)
+            x_temp = x.transpose(1, 2).reshape(B * J, T, D)  # [B*J, T, D]
+            ta_out = self.limm(x_temp)                         # [B*J, T, D] with residual
+            ta_out = ta_out.reshape(B, J, T, D).transpose(1, 2)  # [B, T, J, D]
+            delta = ta_out - x
+            delta = featurewise_affine(delta, temp_cond)
+            x = x + delta
+            ta_weight = None
+        else:
+            ta_out = self.temp_norm(x.transpose(1, 2).reshape(B * J, T, D))
+            if temp_attn is None:
+                ta_out, ta_weight = self.temp_attn.forward(ta_out, ta_out, ta_out, key_padding_mask=x_mask, need_weights=True, average_attn_weights=False)
+            else:
+                ta_out, ta_weight = self.temp_attn.forward_with_fixed_attn_weights(temp_attn, ta_out)
+            ta_out = self.temp_dropout(ta_out)
+            ta_out = ta_out.reshape(B, J, T, D).transpose(1, 2)
+            ta_out = featurewise_affine(ta_out, temp_cond)
+            x = x + ta_out
+
+        # ── Skeletal attention (always full) ──
+        sa_out, sa_weight = self._sa_block(x.reshape(B * T, J, D),
+                                            fixed_attn=skel_attn)
+        sa_out = sa_out.reshape(B, T, J, D)
+        sa_out = featurewise_affine(sa_out, skel_cond)
+        x = x + sa_out
+
+        # ── Text injection ──
+        if self.use_atii:
+            atii_out = self.atii(x.reshape(B, T * J, D), memory, text_mask=memory_mask)
+            atii_out = atii_out.reshape(B, T, J, D)
+            atii_out = featurewise_affine(atii_out, cross_cond)
+            x = x + atii_out
+            ca_weight = None
+        else:
+            x_flat = self.cross_src_norm(x.reshape(B, T * J, D))
+            mem = self.cross_tgt_norm(memory)
+            if cross_attn is None:
+                ca_out, ca_weight = self.cross_attn.forward(x_flat, mem, mem, key_padding_mask=memory_mask, need_weights=True, average_attn_weights=False)
+            else:
+                ca_out, ca_weight = self.cross_attn.forward_with_fixed_attn_weights(cross_attn, mem)
+            ca_out = self.cross_dropout(ca_out)
+            ca_out = ca_out.reshape(B, T, J, D)
+            ca_out = featurewise_affine(ca_out, cross_cond)
+            x = x + ca_out
+
+        # ── FFN ──
+        ff_out = self._ff_block(x)
+        ff_out = featurewise_affine(ff_out, ffn_cond)
+        x = x + ff_out
+
+        attn_weights = (sa_weight, ta_weight, ca_weight)
+        return x, attn_weights
+
+
+# ═══════════════════════════════════════════════════════════════
+#  SkipTransformer: U-Net style skip connections
+# ═══════════════════════════════════════════════════════════════
 
 class SkipTransformer(nn.Module):
     def __init__(self, opt):
@@ -240,17 +464,30 @@ class SkipTransformer(nn.Module):
         if self.opt.n_layers % 2 != 1:
             raise ValueError(f"n_layers should be odd for SkipTransformer, but got {self.opt.n_layers}")
         
+        use_limm = getattr(opt, 'use_limm', False)
+        use_atii = getattr(opt, 'use_atii', False)
+
         # transformer encoder
         self.input_blocks = nn.ModuleList()
-        self.middle_block = STTransformerLayer(opt)
+        self.middle_block = STTransformerLayer(opt)  # middle always full
         self.output_blocks = nn.ModuleList()
         self.skip_blocks = nn.ModuleList()
 
         for i in range((self.opt.n_layers - 1) // 2):
-            self.input_blocks.append(STTransformerLayer(opt))
+            # input blocks: use Light if LIMM/ATII enabled
+            if use_limm or use_atii:
+                self.input_blocks.append(STTransformerLayerLight(opt, use_limm=use_limm, use_atii=use_atii))
+            else:
+                self.input_blocks.append(STTransformerLayer(opt))
+
+            # output blocks: always full attention
             self.output_blocks.append(STTransformerLayer(opt))
             self.skip_blocks.append(nn.Linear(opt.latent_dim * 2, opt.latent_dim))
         
+        if use_limm or use_atii:
+            n_light = (self.opt.n_layers - 1) // 2
+            n_full = self.opt.n_layers - n_light
+            print(f"  [SkipTransformer] {n_light} Light blocks (LIMM={use_limm}, ATII={use_atii}) + {n_full} Full blocks")
 
     def forward(self, x, timestep_emb, word_emb, sa_mask=None, ca_mask=None, need_attn=False,
                 fixed_sa=None, fixed_ta=None, fixed_ca=None):
@@ -310,7 +547,9 @@ class SkipTransformer(nn.Module):
 
         if need_attn:
             for j in range(len(attn_weights)):
-                attn_weights[j] = torch.stack(attn_weights[j], dim=1)
+                # Filter out None entries from Light blocks (LIMM/ATII return None)
+                valid = [w for w in attn_weights[j] if w is not None]
+                attn_weights[j] = torch.stack(valid, dim=1) if valid else None
         else:
             for j in range(len(attn_weights)):
                 attn_weights[j] = None
