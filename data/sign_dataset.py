@@ -1,7 +1,11 @@
 """
 Sign language datasets for SALAD.
-- SignMotionDataset:       VAE training  — __getitem__ returns motion [W, 133]
+- SignMotionDataset:       VAE training  — __getitem__ returns motion [W, D]
 - SignText2MotionDataset:  Denoiser training — __getitem__ returns (text, motion, m_length)
+
+joint_root 옵션:
+  None  → 기존 133D axis-angle (프레임별 pkl, SMPL-X FK 필요)
+  경로  → 135D joint coordinates (사전 변환된 .npy, FK 불필요)
 
 Data loading from SOKE (H2S.py / dataset_m_vq_sign.py / dataset_t2m.py).
 Return format matches SALAD (data/t2m_dataset.py).
@@ -19,11 +23,13 @@ from copy import deepcopy
 
 from data.load_sign_data import (
     load_h2s_sample, load_csl_sample, load_phoenix_sample,
+    load_h2s_joint, load_csl_joint, load_phoenix_joint,
     BAD_H2S_IDS, get_encoder_cache_name,
 )
 
 
 # ─── Shared annotation builder ───────────────────────────────
+# annotation은 항상 원본 data root에서 빌드 (CSV, gzip pickle)
 
 def _build_annotations(split, dataset_name, data_root, csl_root=None, phoenix_root=None):
     """Build list of annotation dicts (mirrors SOKE H2S.py __init__)."""
@@ -75,7 +81,10 @@ def _build_annotations(split, dataset_name, data_root, csl_root=None, phoenix_ro
     return all_data
 
 
+# ─── Loading dispatchers ─────────────────────────────────────
+
 def _load_one(ann, csl_root, phoenix_root):
+    """133D axis-angle 로딩"""
     src = ann['src']
     if src == 'how2sign':
         return load_h2s_sample(ann, ann['_poses_dir'])
@@ -86,11 +95,26 @@ def _load_one(ann, csl_root, phoenix_root):
     return None, None, None
 
 
+def _load_one_joint(ann, joint_root, split):
+    """135D joint coordinates 로딩 (data_joint 구조)"""
+    src = ann['src']
+    if src == 'how2sign':
+        joint_dir = os.path.join(joint_root, 'How2Sign', split, 'poses')
+        return load_h2s_joint(ann, joint_dir)
+    elif src == 'csl':
+        csl_joint = os.path.join(joint_root, 'CSL-Daily')
+        return load_csl_joint(ann, csl_joint)
+    elif src == 'phoenix':
+        phoenix_joint = os.path.join(joint_root, 'Phoenix_2014T')
+        return load_phoenix_joint(ann, phoenix_joint)
+    return None, None, None
+
+
+# ─── Length adjustment ────────────────────────────────────────
+
 def _adjust_length(poses, min_len, max_len, unit_length):
-    """SOKE-style: upsample short / downsample long / center-crop middle.
-    Always returns length that is a multiple of unit_length."""
-    assert min_len % unit_length == 0 and max_len % unit_length == 0, \
-        f"min_len({min_len}) and max_len({max_len}) must be multiples of unit_length({unit_length})"
+    """SOKE-style: upsample short / downsample long / center-crop middle."""
+    assert min_len % unit_length == 0 and max_len % unit_length == 0
     T = poses.shape[0]
     if T < min_len:
         idx = np.linspace(0, T - 1, num=min_len, dtype=int)
@@ -105,13 +129,13 @@ def _adjust_length(poses, min_len, max_len, unit_length):
 
 
 # ─── VAE Dataset ──────────────────────────────────────────────
-# SALAD train_vae.py:  batch = motion tensor  →  trainer.train_forward(batch)
 
 class SignMotionDataset(data.Dataset):
     def __init__(self, opt, mean, std, split='train'):
         self.opt  = opt
-        self.mean = mean   # (133,) numpy
+        self.mean = mean
         self.std  = std
+        self.split = split
         self.window_size    = opt.window_size
         self.unit_length    = getattr(opt, 'unit_length', 4)
         self.min_motion_len = getattr(opt, 'min_motion_length', 40)
@@ -119,7 +143,9 @@ class SignMotionDataset(data.Dataset):
 
         self.csl_root     = getattr(opt, 'csl_root', None)
         self.phoenix_root = getattr(opt, 'phoenix_root', None)
+        self.joint_root   = getattr(opt, 'joint_root', None)  # NEW
 
+        # annotation은 항상 원본 data_root 기준
         self.all_data = _build_annotations(
             split, opt.sign_dataset, opt.data_root,
             self.csl_root, self.phoenix_root)
@@ -132,12 +158,19 @@ class SignMotionDataset(data.Dataset):
 
     def __getitem__(self, idx):
         ann = self.all_data[idx]
-        poses, text, name = _load_one(ann, self.csl_root, self.phoenix_root)
+
+        # joint_root 설정 시 135D joint, 아니면 133D axis-angle
+        if self.joint_root:
+            poses, text, name = _load_one_joint(ann, self.joint_root, self.split)
+        else:
+            poses, text, name = _load_one(ann, self.csl_root, self.phoenix_root)
+
         if poses is None:
             return self.__getitem__(random.randint(0, len(self) - 1))
 
         poses = (poses - self.mean) / (self.std + 1e-10)
-        poses = _adjust_length(poses, self.min_motion_len, self.max_motion_len, self.unit_length)
+        poses = _adjust_length(poses, self.min_motion_len, self.max_motion_len,
+                               self.unit_length)
 
         T = poses.shape[0]
         if T >= self.window_size:
@@ -147,14 +180,12 @@ class SignMotionDataset(data.Dataset):
             idx = np.linspace(0, T - 1, num=self.window_size, dtype=int)
             poses = poses[idx]
 
-        return torch.from_numpy(poses).float()   # [W, 133]
+        return torch.from_numpy(poses).float()   # [W, D]  (D=133 or 135)
 
 
 # ─── Denoiser Dataset ────────────────────────────────────────
-# SALAD train_denoiser.py:  text, motion, m_lens = batch
 
 def _resolve_text_cache_path(ann, split, data_root, csl_root, phoenix_root, encoder_name):
-    """annotation → text embedding cache .pt 경로"""
     src, name = ann['src'], ann['name']
     if src == 'how2sign':
         return os.path.join(data_root, split, 'text_emb', encoder_name, f'{name}.pt')
@@ -174,50 +205,50 @@ class SignText2MotionDataset(data.Dataset):
         self.unit_length    = getattr(opt, 'unit_length', 4)
         self.min_motion_len = getattr(opt, 'min_motion_length', 40)
         self.max_motion_len = opt.max_motion_length
+        self.pose_dim       = opt.pose_dim  # 133 or 135
 
         self.data_root    = getattr(opt, 'data_root', None)
         self.csl_root     = getattr(opt, 'csl_root', None)
         self.phoenix_root = getattr(opt, 'phoenix_root', None)
+        self.joint_root   = getattr(opt, 'joint_root', None)  # NEW
 
         self.all_data = _build_annotations(
             split, opt.sign_dataset, self.data_root,
             self.csl_root, self.phoenix_root)
 
         # ── text embedding cache ──
-        self.use_text_cache = getattr(opt, 'use_text_cache', False)
-        self.encoder_cache_name = None
+        self.use_text_cache = False
+        self.cfg_drop_prob  = getattr(opt, 'cfg_drop_prob', 0.0)
         self.empty_text_emb = None
-        self.cfg_drop_prob = getattr(opt, 'cond_drop_prob', 0.0) if split == 'train' else 0.0
+        self.encoder_cache_name = None
 
-        if self.use_text_cache:
+        text_encoder = getattr(opt, 'text_encoder', None)
+        if text_encoder:
             self.encoder_cache_name = get_encoder_cache_name(
-                getattr(opt, 'text_encoder', 'clip'),
+                text_encoder,
                 getattr(opt, 'clip_version', 'ViT-B/32'),
-                getattr(opt, 'xlmr_version', 'xlm-roberta-base'),
-            )
-            # Load empty embedding for CFG dropout
-            for root in [self.data_root, self.csl_root, self.phoenix_root]:
-                if root is None:
-                    continue
-                empty_path = os.path.join(root, 'text_emb', self.encoder_cache_name, '__empty__.pt')
-                if os.path.exists(empty_path):
-                    e = torch.load(empty_path, map_location='cpu')
-                    self.empty_text_emb = (e['word_emb'], e['attn_mask'], e['token_pos'])
-                    print(f"  [TextCache] loaded __empty__.pt from {root}")
-                    break
-            if self.empty_text_emb is None:
-                print("  [TextCache] WARNING: __empty__.pt not found, CFG dropout will use zeros")
+                getattr(opt, 'xlmr_version', 'xlm-roberta-base'))
 
-            # Verify cache exists for first sample
-            sample_ann = self.all_data[0]
-            sample_path = _resolve_text_cache_path(
-                sample_ann, split, self.data_root, self.csl_root, self.phoenix_root, self.encoder_cache_name)
-            if sample_path and os.path.exists(sample_path):
-                print(f"  [TextCache] ON — encoder={self.encoder_cache_name}, split={split}")
-            else:
-                print(f"  [TextCache] WARNING: cache not found at {sample_path}")
-                print(f"  [TextCache] Run cache_text_embeddings.py first! Falling back to text strings.")
-                self.use_text_cache = False
+            sample_ann = self.all_data[0] if self.all_data else None
+            if sample_ann:
+                sample_path = _resolve_text_cache_path(
+                    sample_ann, split, self.data_root,
+                    self.csl_root, self.phoenix_root, self.encoder_cache_name)
+                if sample_path and os.path.exists(sample_path):
+                    self.use_text_cache = True
+                    print(f"  Text cache ON: {self.encoder_cache_name}")
+
+                    # empty embedding for CFG dropout
+                    empty_dir = os.path.dirname(sample_path)
+                    empty_path = os.path.join(empty_dir, '__empty__.pt')
+                    if os.path.exists(empty_path):
+                        self.empty_text_emb = torch.load(empty_path, map_location='cpu')
+                        self.empty_text_emb = (
+                            self.empty_text_emb['word_emb'],
+                            self.empty_text_emb['attn_mask'],
+                            self.empty_text_emb['token_pos'])
+                else:
+                    print(f"  Text cache not found, falling back to text strings.")
 
     def inv_transform(self, data):
         return data * self.std + self.mean
@@ -227,22 +258,27 @@ class SignText2MotionDataset(data.Dataset):
 
     def __getitem__(self, idx):
         ann = self.all_data[idx]
-        poses, text, name = _load_one(ann, self.csl_root, self.phoenix_root)
+
+        if self.joint_root:
+            poses, text, name = _load_one_joint(ann, self.joint_root, self.split)
+        else:
+            poses, text, name = _load_one(ann, self.csl_root, self.phoenix_root)
+
         if poses is None:
             return self.__getitem__(random.randint(0, len(self) - 1))
 
         poses = (poses - self.mean) / (self.std + 1e-10)
-        poses = _adjust_length(poses, self.min_motion_len, self.max_motion_len, self.unit_length)
+        poses = _adjust_length(poses, self.min_motion_len, self.max_motion_len,
+                               self.unit_length)
         m_length = poses.shape[0]
 
         # pad to max for batching
         if m_length < self.max_motion_len:
-            pad = np.zeros((self.max_motion_len - m_length, 133))
+            pad = np.zeros((self.max_motion_len - m_length, self.pose_dim))
             poses = np.concatenate([poses, pad], axis=0)
 
-        # ── text output: cached tensor tuple or raw string ──
+        # ── text output ──
         if self.use_text_cache:
-            # CFG dropout
             if self.cfg_drop_prob > 0 and random.random() < self.cfg_drop_prob:
                 if self.empty_text_emb is not None:
                     text_out = self.empty_text_emb
@@ -250,8 +286,8 @@ class SignText2MotionDataset(data.Dataset):
                     text_out = (torch.zeros(1), torch.zeros(1), torch.tensor(0))
             else:
                 cache_path = _resolve_text_cache_path(
-                    ann, self.split, self.data_root, self.csl_root, self.phoenix_root,
-                    self.encoder_cache_name)
+                    ann, self.split, self.data_root, self.csl_root,
+                    self.phoenix_root, self.encoder_cache_name)
                 cache = torch.load(cache_path, map_location='cpu')
                 text_out = (cache['word_emb'], cache['attn_mask'], cache['token_pos'])
         else:

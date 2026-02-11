@@ -61,7 +61,27 @@ class DenoiserTrainer:
             self.scaler = torch.cuda.amp.GradScaler(enabled=self.use_amp)
             if self.use_amp:
                 print("  [AMP] Mixed precision training enabled (bf16)")
-            
+
+            # Recon loss (motion-space)
+            self.use_recon_loss = getattr(opt, 'use_recon_loss', False)
+            self.lambda_recon = getattr(opt, 'lambda_recon', 0.5)
+            if self.use_recon_loss:
+                print(f"  [ReconLoss] Enabled — lambda_recon={self.lambda_recon}")
+
+    def _recover_x0(self, pred, noisy_latent, noise, timesteps):
+        """Recover x₀ prediction from denoiser output based on prediction_type."""
+        if self.opt.prediction_type == "sample":
+            return pred
+        alphas_cumprod = self.noise_scheduler.alphas_cumprod.to(pred.device)
+        alpha_t = alphas_cumprod[timesteps]
+        # reshape for broadcasting: [B] → [B, 1, 1, 1]
+        while alpha_t.ndim < pred.ndim:
+            alpha_t = alpha_t.unsqueeze(-1)
+        if self.opt.prediction_type == "epsilon":
+            return (noisy_latent - (1 - alpha_t).sqrt() * pred) / alpha_t.sqrt()
+        elif self.opt.prediction_type == "v_prediction":
+            return alpha_t.sqrt() * noisy_latent - (1 - alpha_t).sqrt() * pred
+        raise NotImplementedError(f"Unknown prediction_type: {self.opt.prediction_type}")
     
     def train_forward(self, batch_data):
         # setup input
@@ -132,7 +152,17 @@ class DenoiserTrainer:
                 
             else:
                 raise NotImplementedError(f"Prediction type {self.opt.prediction_type} not implemented")
-                
+
+            # ── recon loss: decode predicted x₀ and compare in motion space ──
+            if self.use_recon_loss:
+                x0_pred = self._recover_x0(pred, noisy_latent, noise, timesteps)
+                motion_pred = self.vae.decode(x0_pred)  # [B, T_full, 133] — VAE frozen, grad flows to denoiser
+                # align lengths (VAE may upsample temporally)
+                T_min = min(motion_pred.shape[1], motion.shape[1])
+                loss_recon = F.l1_loss(motion_pred[:, :T_min], motion[:, :T_min])
+                loss += self.lambda_recon * loss_recon
+                loss_dict["loss_recon"] = loss_recon
+
             loss_dict["loss"] = loss
 
         return loss, attn_list, loss_dict

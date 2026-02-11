@@ -30,6 +30,8 @@ def arg_parse(is_train=False):
     parser.add_argument("--eta_min", default=1e-6, type=float, help="min lr for cosine annealing")
     parser.add_argument("--weight_decay", default=1e-6, type=float, help="weight decay")
     parser.add_argument("--recon_loss", type=str, default="l2", help="reconstruction loss", choices=["l1", "l1_smooth", "l2"])
+    parser.add_argument("--use_recon_loss", action="store_true", help="add motion-space recon loss via VAE decode")
+    parser.add_argument("--lambda_recon", type=float, default=0.5, help="weight for recon loss")
 
     ## denoiser arch
     parser.add_argument("--text_encoder", type=str, default="clip",
@@ -68,7 +70,7 @@ def arg_parse(is_train=False):
 
     ## sign-specific options  ## PATCH
     parser.add_argument("--sign_dataset", type=str, default="how2sign",
-                        choices=["how2sign", "csl", "how2sign_csl", "how2sign_csl_phoenix"])
+                        choices=["how2sign", "csl", "phoenix", "how2sign_csl", "how2sign_csl_phoenix"])
     parser.add_argument("--skeleton_mode", type=str, default="7part",
                         choices=["7part", "finger"],
                         help="sign skeleton grouping: 7part(default) or finger(15 tokens)")

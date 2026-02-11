@@ -1,5 +1,9 @@
 """
-Sign language data loading functions.
+load_sign_data.py — Sign language data loading functions.
+
+기존 133D axis-angle + 135D joint coordinates 모두 지원.
+joint_root가 주어지면 data_joint/{dataset}/에서 .npy 로드 (FK 불필요).
+
 Ported from SOKE (mGPT/data/humanml/load_data.py).
 """
 import pickle
@@ -39,7 +43,6 @@ BAD_H2S_IDS = {
 
 
 def get_encoder_cache_name(text_encoder, clip_version='ViT-B/32', xlmr_version='xlm-roberta-base'):
-    """Text encoder → cache dir name.  e.g. xlm-roberta-base → 'xlmr-base'"""
     if text_encoder == 'xlm-roberta':
         return xlmr_version.replace('xlm-roberta-', 'xlmr-')
     return 'clip-' + clip_version.replace('/', '').replace('-', '').lower()
@@ -50,8 +53,11 @@ def _subsample(input_list, count):
     return [input_list[int(math.floor(i * ss))] for i in range(count)]
 
 
+# ═══════════════════════════════════════════════════════════════════════
+# 133D axis-angle loading (기존 — 변경 없음)
+# ═══════════════════════════════════════════════════════════════════════
+
 def _179_to_133(poses_179):
-    """179D SMPL-X -> 133D: drop lower body (36D) + shape (10D), keep expr."""
     poses = poses_179[:, (3 + 3 * 11):]
     poses = np.concatenate([poses[:, :-20], poses[:, -10:]], axis=1)
     return poses
@@ -125,3 +131,72 @@ def load_phoenix_sample(ann, phoenix_root):
         clip_poses[fid] = np.concatenate([poses[k] for k in SMPLX_KEYS], 0)
 
     return _179_to_133(clip_poses), text, name
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# 135D joint coordinates loading (신규)
+# ═══════════════════════════════════════════════════════════════════════
+#
+# data_joint 구조 (원본 미러링):
+#   {joint_root}/How2Sign/{split}/poses/{name}.npy   [T, 135]
+#   {joint_root}/CSL-Daily/poses/{name}.npy           [T, 135]
+#   {joint_root}/Phoenix_2014T/{split}/{name}.npy     [T, 135]
+#   {joint_root}/mean.npy, std.npy                    [135]
+#
+# 45-joint layout (local index):
+#   0:     jaw
+#   1-14:  upper body (pelvis, spine1, spine2, spine3, neck, L/R_collar,
+#          head, L/R_shoulder, L/R_elbow, L/R_wrist)
+#   15-29: left hand (15 joints)
+#   30-44: right hand (15 joints)
+
+def load_mean_std_joints(joint_root):
+    """Load joint mean/std from data_joint root."""
+    mean = np.load(os.path.join(joint_root, 'mean.npy'))
+    std  = np.load(os.path.join(joint_root, 'std.npy'))
+    return mean, std
+
+
+def load_h2s_joint(ann, joint_dir):
+    """
+    joint_dir = {joint_root}/How2Sign/{split}/poses
+    """
+    name = ann['name']
+    path = os.path.join(joint_dir, f'{name}.npy')
+    if not os.path.exists(path):
+        return None, None, None
+    joints = np.load(path)  # [T, 135]
+    if joints.shape[0] < 4:
+        return None, None, None
+    return joints, ann['text'], name
+
+
+def load_csl_joint(ann, csl_joint_root):
+    """
+    csl_joint_root = {joint_root}/CSL-Daily
+    Loads: {csl_joint_root}/poses/{name}.npy
+    """
+    name = ann['name']
+    path = os.path.join(csl_joint_root, 'poses', f'{name}.npy')
+    if not os.path.exists(path):
+        return None, None, None
+    joints = np.load(path)
+    if joints.shape[0] < 4:
+        return None, None, None
+    return joints, ann['text'], name
+
+
+def load_phoenix_joint(ann, phoenix_joint_root):
+    """
+    phoenix_joint_root = {joint_root}/Phoenix_2014T
+    name already contains split prefix: e.g. 'train/11August_...'
+    Loads: {phoenix_joint_root}/{name}.npy
+    """
+    name = ann['name']
+    path = os.path.join(phoenix_joint_root, f'{name}.npy')
+    if not os.path.exists(path):
+        return None, None, None
+    joints = np.load(path)
+    if joints.shape[0] < 4:
+        return None, None, None
+    return joints, ann['text'], name

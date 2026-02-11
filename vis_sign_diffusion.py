@@ -388,7 +388,7 @@ def main():
     parser.add_argument('--phoenix_root', default=None)
     parser.add_argument('--mean_path', required=True)
     parser.add_argument('--std_path', required=True)
-    parser.add_argument('--smplx_path', default='deps/smpl_models/smplx')
+    parser.add_argument('--smplx_path', default='deps/smpl_models/')
 
     # Custom text mode (no GT)
     parser.add_argument('--text', default=None, nargs='+',
