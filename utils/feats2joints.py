@@ -1,117 +1,128 @@
-"""
-feats2joints.py — 133D axis-angle → SMPL-X FK → 3D joints
-
-133D layout (upper body only, lower body removed):
-  [0:3]     root (pelvis) orientation
-  [3:15]    upper body joints (spine1~chest, 4 joints × 3)
-  [15:30]   neck~shoulders (5 joints × 3)
-  [30:75]   left hand (15 joints × 3)
-  [75:120]  right hand (15 joints × 3)
-  [120:123] jaw (1 joint × 3)
-  [123:133] expression (10D)
-
-To feed SMPL-X we prepend 36D zeros for lower body → 169D total.
-"""
+"""feats2joints.py - Sign10 210D/120D -> SMPL-X FK -> 3D joints"""
 
 import torch
-import smplx
-import os
+import numpy as np
+from utils.sign_paramUtil import sign10_to_smplx_input, sign10_vel_to_rotation
 
-# Default shape params from SOKE (average body shape)
 DEFAULT_BETAS = torch.tensor([
     -0.07284723, 0.1795129, -0.27608207, 0.135155, 0.10748172,
      0.16037364, -0.01616933, -0.03450319, 0.01369138, 0.01108842
 ])
-
 _body_model_cache = {}
 
 
-def _get_body_model(model_path, device='cpu'):
-    """Load and cache SMPL-X neutral model."""
+def _get_body_model(model_path, device="cpu"):
     key = (model_path, str(device))
     if key not in _body_model_cache:
+        import smplx
         _body_model_cache[key] = smplx.create(
-            model_path=model_path,
-            model_type='smplx',
-            gender='neutral',
-            use_pca=False,
-            use_face_contour=False,
-            batch_size=1,
+            model_path=model_path, model_type="smplx", gender="neutral",
+            use_pca=False, use_face_contour=False, batch_size=1,
         ).to(device).eval()
     return _body_model_cache[key]
 
 
-def aa133_to_joints(features, mean, std, smplx_model_path,
-                    device='cpu', betas=None):
-    """
-    133D normalized features → SMPL-X FK → joints [B, T, J, 3]
+def _run_fk(smplx_in, smplx_model_path, device, betas, BT):
+    """Common FK logic."""
+    if betas is None:
+        betas = DEFAULT_BETAS
+    betas_exp = betas.to(device).unsqueeze(0).expand(BT, -1)
+    zero3 = torch.zeros(BT, 3, device=device)
+    zero10 = torch.zeros(BT, 10, device=device)
+    model = _get_body_model(smplx_model_path, device)
+    with torch.no_grad():
+        output = model(
+            global_orient=smplx_in["global_orient"].to(device),
+            body_pose=smplx_in["body_pose"].to(device),
+            left_hand_pose=smplx_in["left_hand_pose"].to(device),
+            right_hand_pose=smplx_in["right_hand_pose"].to(device),
+            jaw_pose=zero3, leye_pose=zero3, reye_pose=zero3,
+            expression=zero10, betas=betas_exp,
+        )
+    return output.joints.cpu()
 
-    Args:
-        features: [B, T, 133] normalized tensor
-        mean: [133] tensor
-        std: [133] tensor
-        smplx_model_path: path to smplx model directory
-            e.g., 'deps/smpl_models/smplx'
-        device: 'cpu' or 'cuda:X'
-        betas: [10] body shape params (optional, uses default if None)
 
-    Returns:
-        joints: [B, T, J, 3] — J depends on SMPL-X (typically 127+)
-    """
-    # Denormalize
-    features = features * std.to(features) + mean.to(features)
+def sign10_vel_to_joints(features, mean, std, smplx_model_path,
+                         device="cpu", betas=None):
+    """210D sign10_vel normalized -> denorm rotation -> FK -> joints [B,T,J,3]"""
+    mean_t = torch.from_numpy(mean).float() if isinstance(mean, np.ndarray) else mean
+    std_t = torch.from_numpy(std).float() if isinstance(std, np.ndarray) else std
+
+    # Strip velocity -> 120D rotation, then denormalize
+    rot_120 = sign10_vel_to_rotation(features)  # [B, T, 120]
+    rot_denorm = rot_120 * std_t.to(features.device) + mean_t.to(features.device)
+
+    B, T, D = rot_denorm.shape
+    assert D == 120
+    flat = rot_denorm.view(B * T, 120)
+    smplx_in = sign10_to_smplx_input(flat)
+    joints = _run_fk(smplx_in, smplx_model_path, device, betas, B * T)
+    return joints.view(B, T, -1, 3)
+
+
+def sign10_to_joints(features, mean, std, smplx_model_path,
+                     device="cpu", betas=None):
+    """120D sign10 normalized -> FK -> joints [B,T,J,3]"""
+    mean_t = torch.from_numpy(mean).float() if isinstance(mean, np.ndarray) else mean
+    std_t = torch.from_numpy(std).float() if isinstance(std, np.ndarray) else std
+    features = features * std_t.to(features.device) + mean_t.to(features.device)
 
     B, T, D = features.shape
-    assert D == 133, f"Expected 133D features, got {D}"
+    assert D == 120
+    flat = features.view(B * T, 120)
+    smplx_in = sign10_to_smplx_input(flat)
+    joints = _run_fk(smplx_in, smplx_model_path, device, betas, B * T)
+    return joints.view(B, T, -1, 3)
+
+def aa133_to_joints(features, mean, std, smplx_model_path,
+                    device='cpu', betas=None):
+    """133D normalized features → SMPL-X FK → joints [B, T, J, 3]"""
+    mean_t = torch.from_numpy(mean).float() if isinstance(mean, np.ndarray) else mean
+    std_t = torch.from_numpy(std).float() if isinstance(std, np.ndarray) else std
+    features = features * std_t.to(features.device) + mean_t.to(features.device)
+
+    B, T, D = features.shape
+    assert D == 133, f"Expected 133D, got {D}"
 
     # Prepend 36D zeros for lower body → 169D
     zero_lower = torch.zeros(B, T, 36, device=features.device, dtype=features.dtype)
     full = torch.cat([zero_lower, features], dim=-1)  # [B, T, 169]
-    full = full.view(B * T, -1)
+    flat = full.view(B * T, -1)
 
-    # Split into SMPL-X params (same mapping as SOKE H2S.py)
-    root_pose   = full[:, 0:3]
-    body_pose   = full[:, 3:66]     # 21 joints × 3 (includes lower body zeros)
-    lhand_pose  = full[:, 66:111]   # 15 joints × 3
-    rhand_pose  = full[:, 111:156]  # 15 joints × 3
-    jaw_pose    = full[:, 156:159]
-    expr        = full[:, 159:169]
+    # Split into SMPL-X params
+    root_pose   = flat[:, 0:3]
+    body_pose   = flat[:, 3:66]      # 21 joints × 3
+    lhand_pose  = flat[:, 66:111]    # 15 joints × 3
+    rhand_pose  = flat[:, 111:156]   # 15 joints × 3
+    jaw_pose    = flat[:, 156:159]
+    expr        = flat[:, 159:169]
 
-    # Shape params
     if betas is None:
         betas = DEFAULT_BETAS
-    betas = betas.to(features.device).unsqueeze(0).expand(B * T, -1)
+    betas_exp = betas.to(device).unsqueeze(0).expand(B * T, -1)
+    zero3 = torch.zeros(B * T, 3, device=device)
 
-    # Zero eye poses
-    zero_eye = torch.zeros(B * T, 3, device=features.device, dtype=features.dtype)
-
-    # SMPL-X forward
-    model = _get_body_model(smplx_model_path, device=features.device)
-
-    # Process in chunks to avoid OOM
+    model = _get_body_model(smplx_model_path, device)
     chunk_size = 512
     all_joints = []
-    for start in range(0, B * T, chunk_size):
-        end = min(start + chunk_size, B * T)
+    for s in range(0, B * T, chunk_size):
+        e = min(s + chunk_size, B * T)
         with torch.no_grad():
             output = model(
-                global_orient=root_pose[start:end],
-                body_pose=body_pose[start:end],
-                left_hand_pose=lhand_pose[start:end],
-                right_hand_pose=rhand_pose[start:end],
-                jaw_pose=jaw_pose[start:end],
-                expression=expr[start:end],
-                betas=betas[start:end],
-                leye_pose=zero_eye[start:end],
-                reye_pose=zero_eye[start:end],
+                global_orient=root_pose[s:e].to(device),
+                body_pose=body_pose[s:e].to(device),
+                left_hand_pose=lhand_pose[s:e].to(device),
+                right_hand_pose=rhand_pose[s:e].to(device),
+                jaw_pose=jaw_pose[s:e].to(device),
+                expression=expr[s:e].to(device),
+                betas=betas_exp[s:e],
+                leye_pose=zero3[s:e],
+                reye_pose=zero3[s:e],
             )
-        all_joints.append(output.joints)
+        all_joints.append(output.joints.cpu())
 
-    joints = torch.cat(all_joints, dim=0)  # [B*T, J, 3]
-    J = joints.shape[1]
-    joints = joints.view(B, T, J, 3)
-    return joints
-
+    joints = torch.cat(all_joints, dim=0)
+    return joints.view(B, T, -1, 3)
 
 def aa133_to_joints_np(motion_133, mean, std, smplx_model_path, device='cpu'):
     """

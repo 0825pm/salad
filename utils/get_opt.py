@@ -104,8 +104,16 @@ def get_opt(opt_path, device, **kwargs):
         opt.max_motion_token = 55
     ## ── PATCH: sign ──
     elif opt.dataset_name == 'sign':
-        opt.joints_num = 7
-        opt.pose_dim = 133
+        skeleton_mode = getattr(opt, 'skeleton_mode', 'sign10_vel')
+        if skeleton_mode == 'sign10_vel':
+            opt.joints_num = 10
+            opt.pose_dim = 210
+        elif skeleton_mode == 'sign10':
+            opt.joints_num = 10
+            opt.pose_dim = 120
+        elif skeleton_mode == '7part':
+            opt.joints_num = 7
+            opt.pose_dim = 133
         opt.contact_joints = []
         opt.fps = 24
         opt.max_motion_length = getattr(opt, 'max_motion_length', 400)

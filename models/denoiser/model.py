@@ -69,16 +69,46 @@ class Denoiser(nn.Module):
         self._cache_word_emb = None
         self._cache_ca_mask = None
         self._cache_tokens_pos = None
+
+        # track fine-tune mode
+        self._finetune_text_encoder = getattr(opt, 'finetune_text_encoder', 'none')
     
+    @property
+    def is_text_encoder_trainable(self):
+        return self._finetune_text_encoder != 'none'
+
     def parameters_without_clip(self):
+        """Denoiser-only parameters (excludes text encoder)."""
         return [param for name, param in self.named_parameters() if "clip_model" not in name]
-    
+
+    def text_encoder_trainable_parameters(self):
+        """Trainable text encoder parameters (empty if frozen)."""
+        if hasattr(self.clip_model, 'trainable_parameters'):
+            return self.clip_model.trainable_parameters()
+        return []
+
+    def all_trainable_parameters(self):
+        """All trainable parameters: denoiser + text encoder (if fine-tuning)."""
+        return [p for p in self.parameters() if p.requires_grad]
+
     def state_dict_without_clip(self):
+        """State dict excluding frozen text encoder weights (and cache)."""
         state_dict = self.state_dict()
         remove_weights = [e for e in state_dict.keys() if "clip_model." in e or "_cache_" in e]
         for e in remove_weights:
             del state_dict[e]
         return state_dict
+
+    def text_encoder_state_dict(self):
+        """State dict for trainable text encoder parameters only."""
+        if hasattr(self.clip_model, 'trainable_state_dict'):
+            return self.clip_model.trainable_state_dict()
+        return {}
+
+    def load_text_encoder_state_dict(self, state_dict):
+        """Load trainable text encoder parameters from checkpoint."""
+        if hasattr(self.clip_model, 'load_trainable_state_dict'):
+            self.clip_model.load_trainable_state_dict(state_dict)
     
     def remove_clip_cache(self):
         self._cache_word_emb = None

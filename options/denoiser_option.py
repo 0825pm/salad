@@ -41,6 +41,18 @@ def arg_parse(is_train=False):
     parser.add_argument("--xlmr_version", type=str, default="xlm-roberta-base",
                         choices=["xlm-roberta-base", "xlm-roberta-large"],
                         help="XLM-RoBERTa version (used when text_encoder=xlm-roberta)")
+
+    ## text encoder fine-tuning
+    parser.add_argument("--finetune_text_encoder", type=str, default="none",
+                        choices=["none", "full", "lora"],
+                        help="Fine-tune text encoder: 'none'(frozen), 'full', 'lora'")
+    parser.add_argument("--text_encoder_lr", type=float, default=1e-5,
+                        help="Learning rate for text encoder (separate from denoiser LR)")
+    parser.add_argument("--lora_rank", type=int, default=16,
+                        help="LoRA rank (used when finetune_text_encoder=lora)")
+    parser.add_argument("--lora_alpha", type=float, default=32.0,
+                        help="LoRA alpha scaling (used when finetune_text_encoder=lora)")
+
     parser.add_argument("--latent_dim", type=int, default=256, help="embedding dimension")
     parser.add_argument("--n_heads", type=int, default=8, help="Number of heads")
     parser.add_argument("--n_layers", type=int, default=5, help="num of layers")
@@ -72,8 +84,8 @@ def arg_parse(is_train=False):
     parser.add_argument("--sign_dataset", type=str, default="how2sign",
                         choices=["how2sign", "csl", "phoenix", "how2sign_csl", "how2sign_csl_phoenix"])
     parser.add_argument("--skeleton_mode", type=str, default="7part",
-                        choices=["7part", "finger"],
-                        help="sign skeleton grouping: 7part(default) or finger(15 tokens)")
+                        choices=["7part", "finger", "sign10", "sign10_vel"],
+                        help="sign skeleton grouping: 7part(default), finger(15), sign10(10), sign10_vel(10+vel)")
     parser.add_argument("--data_root", type=str, default=None)
     parser.add_argument("--csl_root", type=str, default=None)
     parser.add_argument("--phoenix_root", type=str, default=None)
@@ -90,19 +102,26 @@ def arg_parse(is_train=False):
     parser.add_argument("--eval_every_e", default=10, type=int, help="save eval results every n epoch")
 
     opt = parser.parse_args()
-    opt.classifier_free_guidance = opt.cond_scale > 1.0
     torch.cuda.set_device(opt.gpu_id)
     opt.device = torch.device("cpu" if opt.gpu_id == -1 else "cuda:" + str(opt.gpu_id))
 
     opt.save_root = pjoin(opt.checkpoints_dir, opt.dataset_name, opt.name)
     opt.model_dir = pjoin(opt.save_root, 'model')
+    opt.meta_dir = pjoin(opt.save_root, 'meta')
     opt.eval_dir = pjoin(opt.save_root, 'animation')
     opt.log_dir = pjoin('./log', opt.dataset_name, opt.name)
 
     os.makedirs(opt.model_dir, exist_ok=True)
+    os.makedirs(opt.meta_dir, exist_ok=True)
     os.makedirs(opt.eval_dir, exist_ok=True)
     os.makedirs(opt.log_dir, exist_ok=True)
 
+    # ── Validate: text cache + finetune are incompatible ──
+    if opt.finetune_text_encoder != 'none' and opt.use_text_cache:
+        print("[WARN] --use_text_cache disabled because --finetune_text_encoder is active.")
+        opt.use_text_cache = False
+
+    # ── dataset-specific config ──
     if opt.dataset_name == "t2m":
         opt.data_root = opt.data_root or './dataset/humanml3d/'
         opt.motion_dir = pjoin(opt.data_root, 'new_joint_vecs')
@@ -123,7 +142,7 @@ def arg_parse(is_train=False):
         opt.pose_dim = 251
         opt.contact_joints = [19, 20, 14, 15]
         opt.fps = 12.5
-        opt.radius = 240 * 8
+        opt.radius = 4
         opt.kinematic_chain = paramUtil.kit_kinematic_chain
         opt.dataset_opt_path = './checkpoints/kit/Comp_v6_KLD005/opt.txt'
 
@@ -132,7 +151,7 @@ def arg_parse(is_train=False):
         from utils.sign_paramUtil import get_sign_config
         _, _, _, num_j = get_sign_config(opt.skeleton_mode)
         opt.data_root = opt.data_root or './dataset/how2sign/'
-        opt.joints_num = num_j   # 7 (7part) or 15 (finger)
+        opt.joints_num = num_j   # 7 / 15 / 10
         opt.pose_dim = 133
         opt.contact_joints = []
         opt.fps = 24

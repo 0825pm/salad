@@ -43,8 +43,11 @@ BAD_H2S_IDS = {
 
 
 def get_encoder_cache_name(text_encoder, clip_version='ViT-B/32', xlmr_version='xlm-roberta-base'):
+    """Return cache directory name for the given text encoder."""
     if text_encoder == 'xlm-roberta':
         return xlmr_version.replace('xlm-roberta-', 'xlmr-')
+    elif text_encoder == 'mbart':
+        return 'mbart_soke'
     return 'clip-' + clip_version.replace('/', '').replace('-', '').lower()
 
 

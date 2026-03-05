@@ -33,6 +33,17 @@ class DenoiserTrainer:
         self.vae = vae.to(opt.device)
         self.noise_scheduler = scheduler
 
+        # Text encoder fine-tuning mode
+        self.finetune_text_encoder = getattr(opt, 'finetune_text_encoder', 'none')
+        self.text_encoder_lr = getattr(opt, 'text_encoder_lr', 1e-5)
+
+        if self.finetune_text_encoder != 'none':
+            print(f"  [TextEncoder] Fine-tuning mode: {self.finetune_text_encoder}, "
+                  f"LR: {self.text_encoder_lr}")
+            if getattr(opt, 'use_text_cache', False):
+                print(f"  [WARN] Text cache disabled (incompatible with fine-tuning)")
+                opt.use_text_cache = False
+
         if opt.is_train:
             self.logger = SummaryWriter(opt.log_dir)
             if opt.recon_loss == "l1":
@@ -68,6 +79,31 @@ class DenoiserTrainer:
             if self.use_recon_loss:
                 print(f"  [ReconLoss] Enabled — lambda_recon={self.lambda_recon}")
 
+    def _build_optimizer(self):
+        """Build optimizer with separate param groups for denoiser and text encoder."""
+        # Group 1: denoiser parameters (excluding text encoder)
+        denoiser_params = self.denoiser.parameters_without_clip()
+        param_groups = [
+            {'params': denoiser_params, 'lr': self.opt.lr, 'name': 'denoiser'},
+        ]
+
+        # Group 2: text encoder trainable parameters (if fine-tuning)
+        if self.finetune_text_encoder != 'none':
+            te_params = self.denoiser.text_encoder_trainable_parameters()
+            if te_params:
+                param_groups.append({
+                    'params': te_params,
+                    'lr': self.text_encoder_lr,
+                    'name': 'text_encoder',
+                })
+                n_te = sum(p.numel() for p in te_params)
+                print(f"  [Optimizer] text_encoder group: {n_te/1e6:.2f}M params, lr={self.text_encoder_lr}")
+
+        n_denoiser = sum(p.numel() for p in denoiser_params if p.requires_grad)
+        print(f"  [Optimizer] denoiser group: {n_denoiser/1e6:.2f}M params, lr={self.opt.lr}")
+
+        return torch.optim.AdamW(param_groups, betas=(0.9, 0.99), weight_decay=self.opt.weight_decay)
+
     def _recover_x0(self, pred, noisy_latent, noise, timesteps):
         """Recover x₀ prediction from denoiser output based on prediction_type."""
         if self.opt.prediction_type == "sample":
@@ -82,7 +118,7 @@ class DenoiserTrainer:
         elif self.opt.prediction_type == "v_prediction":
             return alpha_t.sqrt() * noisy_latent - (1 - alpha_t).sqrt() * pred
         raise NotImplementedError(f"Unknown prediction_type: {self.opt.prediction_type}")
-    
+
     def train_forward(self, batch_data):
         # setup input
         text_or_emb, motion, m_lens = batch_data
@@ -255,11 +291,14 @@ class DenoiserTrainer:
     
 
     def update_lr_warm_up(self, nb_iter, warm_up_iter, lr):
-        current_lr = lr * (nb_iter + 1) / (warm_up_iter + 1)
+        """Warm up both denoiser and text encoder LR."""
+        ratio = (nb_iter + 1) / (warm_up_iter + 1)
         for param_group in self.optim.param_groups:
-            param_group["lr"] = current_lr
-
-        return current_lr
+            if param_group.get('name') == 'text_encoder':
+                param_group["lr"] = self.text_encoder_lr * ratio
+            else:
+                param_group["lr"] = lr * ratio
+        return lr * ratio
     
 
     def save(self, file_name, epoch, total_iter):
@@ -271,6 +310,13 @@ class DenoiserTrainer:
             "epoch": epoch,
             "total_iter": total_iter,
         }
+        # Save text encoder trainable weights if fine-tuning
+        if self.finetune_text_encoder != 'none':
+            te_state = self.denoiser.text_encoder_state_dict()
+            if te_state:
+                state["text_encoder"] = te_state
+                state["finetune_text_encoder"] = self.finetune_text_encoder
+
         torch.save(state, file_name)
 
 
@@ -279,6 +325,11 @@ class DenoiserTrainer:
         missing_keys, unexpected_keys = self.denoiser.load_state_dict(checkpoint["denoiser"], strict=False)
         assert len(unexpected_keys) == 0
         assert all([k.startswith("clip_model.") for k in missing_keys])
+
+        # Load text encoder trainable weights
+        if "text_encoder" in checkpoint and self.finetune_text_encoder != 'none':
+            self.denoiser.load_text_encoder_state_dict(checkpoint["text_encoder"])
+            print(f"  Loaded text encoder weights (mode={checkpoint.get('finetune_text_encoder', '?')})")
 
         try:
             self.optim.load_state_dict(checkpoint["optim"])
@@ -294,8 +345,8 @@ class DenoiserTrainer:
         self.denoiser.to(self.opt.device)
         self.vae.to(self.opt.device)
 
-        # optimizer
-        self.optim = torch.optim.AdamW(self.denoiser.parameters(), lr=self.opt.lr, betas=(0.9, 0.99), weight_decay=self.opt.weight_decay)
+        # optimizer — with separate param groups
+        self.optim = self._build_optimizer()
         total_iters = self.opt.max_epoch * len(train_loader)
         if getattr(self.opt, 'lr_schedule', 'multistep') == 'cosine':
             eta_min = getattr(self.opt, 'eta_min', 1e-6)
@@ -326,8 +377,6 @@ class DenoiserTrainer:
                 best_fid=best_fid, best_div=best_div, best_top1=best_top1, best_top2=best_top2, best_top3=best_top3, best_matching=best_matching,
                 eval_wrapper=eval_wrapper, save=True, draw=True, device=self.opt.device
             )
-        # else:
-        # best_fid, best_div, best_top1, best_top2, best_top3, best_matching = 1000, 100, 0, 0, 0, 100
 
         # training loop
         while epoch < self.opt.max_epoch:
@@ -350,6 +399,9 @@ class DenoiserTrainer:
                 
                 # log
                 logs["lr"] += self.optim.param_groups[0]["lr"]
+                # Log text encoder LR if fine-tuning
+                if self.finetune_text_encoder != 'none' and len(self.optim.param_groups) > 1:
+                    logs["te_lr"] += self.optim.param_groups[1]["lr"]
                 for tag, value in loss_dict.items():
                     logs[tag] += value.item()
 
@@ -404,58 +456,10 @@ class DenoiserTrainer:
     
     
     @torch.no_grad()
-    def test(self, eval_wrapper, eval_val_loader, repeat_time, save_dir, cal_mm=True, save_motion=True):
-        os.makedirs(save_dir, exist_ok=True)
-        f = open(pjoin(save_dir, f"eval_steps{self.opt.num_inference_timesteps}_scale{self.opt.cond_scale}.log"), "w")
-
-        self.denoiser.eval()
-        self.vae.eval()
-        self.noise_scheduler.set_timesteps(self.opt.num_inference_timesteps)
-        metrics = {
-            "fid": [],
-            "div": [],
-            "top1": [],
-            "top2": [],
-            "top3": [],
-            "matching": [],
-            "mm": []
-        }
-        for i in range(repeat_time):
-            msg, fid, div, R_precision, matching, l1_dist, mm, pred_motion, caption_list = test_denoiser(
-                eval_val_loader, self.generate, i, eval_wrapper, self.opt.joints_num, cal_mm=cal_mm
-            )
-            print(msg, file=f, flush=True)
-            metrics["fid"].append(fid)
-            metrics["div"].append(div)
-            metrics["top1"].append(R_precision[0])
-            metrics["top2"].append(R_precision[1])
-            metrics["top3"].append(R_precision[2])
-            metrics["matching"].append(matching)
-            metrics["mm"].append(mm)
-
-            if save_motion:
-                converter = Joint2BVHConvertor()
-                motion_save_dir = pjoin(save_dir, f"motion-steps{self.opt.num_inference_timesteps}-{i:02d}")
-                os.makedirs(motion_save_dir, exist_ok=True)
-                for i, (motion, caption) in enumerate(zip(pred_motion, caption_list)):
-                    _, ik_joint = converter.convert(motion, pjoin(motion_save_dir, f"{i:06d}_ik.bvh"), foot_ik=True)
-                    plot_3d_motion(pjoin(motion_save_dir, f"{i:06d}.mp4"), self.opt.kinematic_chain, motion, title=caption, fps=self.opt.fps)
-                    np.savez(pjoin(motion_save_dir, f"{i:06d}.npz"), motion=motion, caption=caption)
-
-        fid = np.array(metrics["fid"])
-        div = np.array(metrics["div"])
-        top1 = np.array(metrics["top1"])
-        top2 = np.array(metrics["top2"])
-        top3 = np.array(metrics["top3"])
-        matching = np.array(metrics["matching"])
-        mm = np.array(metrics["mm"])
-        
-        msg_final = f"\tFID: {np.mean(fid):.3f}, conf. {np.std(fid)*1.96/np.sqrt(repeat_time):.3f}\n" \
-                    f"\tDiversity: {np.mean(div):.3f}, conf. {np.std(div)*1.96/np.sqrt(repeat_time):.3f}\n" \
-                    f"\tTOP1: {np.mean(top1):.3f}, conf. {np.std(top1)*1.96/np.sqrt(repeat_time):.3f}, TOP2. {np.mean(top2):.3f}, conf. {np.std(top2)*1.96/np.sqrt(repeat_time):.3f}, TOP3. {np.mean(top3):.3f}, conf. {np.std(top3)*1.96/np.sqrt(repeat_time):.3f}\n" \
-                    f"\tMatching: {np.mean(matching):.3f}, conf. {np.std(matching)*1.96/np.sqrt(repeat_time):.3f}\n" \
-                    f"\tMultimodality: {np.mean(mm):.3f}, conf. {np.std(mm)*1.96/np.sqrt(repeat_time):.3f}\n\n"
-        print(msg_final)
-        print(msg_final, file=f, flush=True)
-
-        f.close()
+    def test(self, eval_wrapper, eval_val_loader, nb_iter,
+             save_dir=None, cal_mm=False, save_motion=False):
+        test_denoiser(
+            save_dir, eval_val_loader, self.denoiser, self.generate,
+            nb_iter, eval_wrapper=eval_wrapper,
+            cal_mm=cal_mm, save_motion=save_motion, device=self.opt.device
+        )

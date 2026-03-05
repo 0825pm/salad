@@ -1,5 +1,5 @@
 """
-vis_sign_joints.py — 135D joint coordinates 시각화
+vis_sign_joints.py — 135D joint coordinates 시각화 (7-part grouped)
 
 data_joint의 .npy 파일을 직접 읽어 skeleton animation 생성.
 SMPL-X FK 불필요 — 이미 3D 좌표이므로 바로 시각화.
@@ -41,43 +41,33 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 
 # =============================================================================
-# 45-joint skeleton definition (local indices)
+# 45-joint skeleton definition (local indices, 7-part grouped)
 # =============================================================================
 #
-# Layout (from convert_smplx_to_joints.py SELECT_IDX):
-#   0:     jaw         (SMPLX #22)
-#   1:     pelvis      (SMPLX #0)
-#   2:     spine1      (SMPLX #3)
-#   3:     spine2      (SMPLX #6)
-#   4:     spine3      (SMPLX #9)
-#   5:     neck        (SMPLX #12)
-#   6:     L_collar    (SMPLX #13)
-#   7:     R_collar    (SMPLX #14)
-#   8:     head        (SMPLX #15)
-#   9:     L_shoulder  (SMPLX #16)
-#   10:    R_shoulder  (SMPLX #17)
-#   11:    L_elbow     (SMPLX #18)
-#   12:    R_elbow     (SMPLX #19)
-#   13:    L_wrist     (SMPLX #20)
-#   14:    R_wrist     (SMPLX #21)
-#   15-29: left hand   (SMPLX #25-39)
-#   30-44: right hand  (SMPLX #40-54)
+# Layout (after reorder in convert_smplx_to_joints.py):
+#   0:  pelvis       1:  spine1       2:  spine2       3:  spine3       (torso)
+#   4:  L_collar     5:  L_shoulder   6:  L_elbow      7:  L_wrist     (L_arm)
+#   8:  R_collar     9:  R_shoulder   10: R_elbow      11: R_wrist     (R_arm)
+#   12-26: left hand (index,middle,pinky,ring,thumb × 3j)              (lhand)
+#   27-41: right hand                                                   (rhand)
+#   42: neck         43: head                                           (head_neck)
+#   44: jaw                                                             (jaw)
 
-ROOT_IDX = 4  # spine3 — 상체 중심
+ROOT_IDX = 3  # spine3 — 상체 중심
 
 BODY_CONNECTIONS = [
     # spine
-    (1, 2), (2, 3), (3, 4), (4, 5), (5, 8),
+    (0, 1), (1, 2), (2, 3),
+    # spine3 → neck → head → jaw
+    (3, 42), (42, 43), (43, 44),
     # left arm
-    (4, 6), (6, 9), (9, 11), (11, 13),
+    (3, 4), (4, 5), (5, 6), (6, 7),
     # right arm
-    (4, 7), (7, 10), (10, 12), (12, 14),
-    # face
-    (8, 0),
+    (3, 8), (8, 9), (9, 10), (10, 11),
 ]
 
 # SMPL-X hand: 5 fingers × 3 joints each
-# Finger order: index(0-2), middle(3-5), pinky(6-8), ring(9-11), thumb(12-14)
+# Finger order within each hand: index, middle, pinky, ring, thumb
 def _hand_connections(wrist_idx, hand_offset):
     """wrist → 5 finger chains"""
     conns = []
@@ -88,14 +78,14 @@ def _hand_connections(wrist_idx, hand_offset):
         conns.append((base + 1, base + 2))
     return conns
 
-LHAND_CONNECTIONS = _hand_connections(13, 15)  # L_wrist → local 15-29
-RHAND_CONNECTIONS = _hand_connections(14, 30)  # R_wrist → local 30-44
+LHAND_CONNECTIONS = _hand_connections(7, 12)   # L_wrist → local 12-26
+RHAND_CONNECTIONS = _hand_connections(11, 27)  # R_wrist → local 27-41
 
 ALL_CONNECTIONS = BODY_CONNECTIONS + LHAND_CONNECTIONS + RHAND_CONNECTIONS
 
-BODY_IDX  = list(range(0, 15))
-LHAND_IDX = list(range(15, 30))
-RHAND_IDX = list(range(30, 45))
+BODY_IDX  = list(range(0, 12)) + [42, 43, 44]
+LHAND_IDX = list(range(12, 27))
+RHAND_IDX = list(range(27, 42))
 
 
 # =============================================================================
@@ -134,9 +124,9 @@ def save_skeleton_video(joints, save_path, title='', fps=25, viewport=0.5):
 
     lines = []
     for (i, j) in ALL_CONNECTIONS:
-        if i >= 30 or j >= 30:
+        if i in RHAND_IDX or j in RHAND_IDX:
             c, lw = colors['rhand'], 1.0
-        elif i >= 15 or j >= 15:
+        elif i in LHAND_IDX or j in LHAND_IDX:
             c, lw = colors['lhand'], 1.0
         else:
             c, lw = colors['body'], 1.5
@@ -204,9 +194,9 @@ def save_comparison_video(left_joints, right_joints, save_path, title='',
     for ax, d in [(ax_l, left), (ax_r, right)]:
         ax_lines = []
         for (i, j) in ALL_CONNECTIONS:
-            if i >= 30 or j >= 30:
+            if i in RHAND_IDX or j in RHAND_IDX:
                 c, lw = colors['rhand'], 1.0
-            elif i >= 15 or j >= 15:
+            elif i in LHAND_IDX or j in LHAND_IDX:
                 c, lw = colors['lhand'], 1.0
             else:
                 c, lw = colors['body'], 1.5
@@ -279,7 +269,7 @@ def main():
     os.makedirs(output_root, exist_ok=True)
 
     print("=" * 60)
-    print("Sign Language Joint Visualization (135D → 45 joints)")
+    print("Sign Language Joint Visualization (135D → 45 joints, 7-part grouped)")
     print(f"  output: {output_root}")
     print("=" * 60)
 

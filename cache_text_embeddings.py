@@ -10,6 +10,7 @@ cache_text_embeddings.py — Text embedding 사전 계산 및 개별 .pt 저장
 Usage:
     cd ~/Projects/research/salad
 
+    # XLM-RoBERTa (기존)
     python cache_text_embeddings.py \
         --text_encoder xlm-roberta --xlmr_version xlm-roberta-base \
         --data_root /home/user/Projects/research/SOKE/data/How2Sign \
@@ -18,6 +19,17 @@ Usage:
         --sign_dataset how2sign_csl_phoenix \
         --splits train val test \
         --batch_size 128
+
+    # mBART (SOKE pretrained)
+    python cache_text_embeddings.py \
+        --text_encoder mbart \
+        --mbart_path deps/mbart-h2s-csl-phoenix \
+        --data_root /home/user/Projects/research/SOKE/data/How2Sign \
+        --csl_root /home/user/Projects/research/SOKE/data/CSL-Daily \
+        --phoenix_root /home/user/Projects/research/SOKE/data/Phoenix_2014T \
+        --sign_dataset how2sign_csl_phoenix \
+        --splits train val test \
+        --batch_size 64
 """
 
 import os
@@ -47,9 +59,10 @@ def resolve_cache_dir(ann, split, data_root, csl_root, phoenix_root, encoder_nam
 
 def main():
     parser = argparse.ArgumentParser(description='Precompute text embeddings for sign datasets')
-    parser.add_argument('--text_encoder', default='xlm-roberta', choices=['clip', 'xlm-roberta'])
+    parser.add_argument('--text_encoder', default='xlm-roberta', choices=['clip', 'xlm-roberta', 'mbart'])
     parser.add_argument('--clip_version', default='ViT-B/32')
     parser.add_argument('--xlmr_version', default='xlm-roberta-base')
+    parser.add_argument('--mbart_path', default='deps/mbart-h2s-csl-phoenix', help='mBART model path (SOKE)')
     parser.add_argument('--data_root', required=True, help='How2Sign root')
     parser.add_argument('--csl_root', default=None)
     parser.add_argument('--phoenix_root', default=None)
@@ -76,6 +89,7 @@ def main():
         text_encoder=args.text_encoder,
         clip_version=args.clip_version,
         xlmr_version=args.xlmr_version,
+        mbart_path=getattr(args, 'mbart_path', 'deps/mbart-h2s-csl-phoenix'),
         device=device,
     )
     from models.denoiser.clip import build_text_encoder

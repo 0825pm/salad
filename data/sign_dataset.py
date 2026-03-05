@@ -7,6 +7,12 @@ joint_root 옵션:
   None  → 기존 133D axis-angle (프레임별 pkl, SMPL-X FK 필요)
   경로  → 135D joint coordinates (사전 변환된 .npy, FK 불필요)
 
+skeleton_mode 옵션:
+  '7part'      → 133D axis-angle, 7 super-joints
+  'finger'     → 133D axis-angle, 15 super-joints
+  'sign10'     → 120D axis-angle (sign10 order), 10 super-joints
+  'sign10_vel' → 210D (120D rotation + 90D velocity), 10 super-joints
+
 Data loading from SOKE (H2S.py / dataset_m_vq_sign.py / dataset_t2m.py).
 Return format matches SALAD (data/t2m_dataset.py).
 """
@@ -83,16 +89,40 @@ def _build_annotations(split, dataset_name, data_root, csl_root=None, phoenix_ro
 
 # ─── Loading dispatchers ─────────────────────────────────────
 
-def _load_one(ann, csl_root, phoenix_root):
-    """133D axis-angle 로딩"""
+def _load_one(ann, csl_root, phoenix_root, skeleton_mode='7part'):
+    """axis-angle 로딩. skeleton_mode에 따라 차원 결정.
+
+    Returns:
+        poses: [T, D] where D depends on skeleton_mode:
+            '7part'/'finger' → 133D
+            'sign10'/'sign10_vel' → 120D (sign10 order, velocity는 나중에)
+        text: str
+        name: str
+    """
     src = ann['src']
+
+    # 항상 133D로 먼저 로딩
     if src == 'how2sign':
-        return load_h2s_sample(ann, ann['_poses_dir'])
+        poses, text, name = load_h2s_sample(ann, ann['_poses_dir'])
     elif src == 'csl':
-        return load_csl_sample(ann, csl_root)
+        poses, text, name = load_csl_sample(ann, csl_root)
     elif src == 'phoenix':
-        return load_phoenix_sample(ann, phoenix_root)
-    return None, None, None
+        poses, text, name = load_phoenix_sample(ann, phoenix_root)
+    else:
+        return None, None, None
+
+    if poses is None:
+        return None, None, None
+
+    # skeleton_mode에 따라 변환
+    if skeleton_mode in ('sign10', 'sign10_vel'):
+        from utils.sign10_config import reorder_to_sign10
+        poses = poses[:, :120]             # 133D → 120D (drop jaw+expr)
+        poses = reorder_to_sign10(poses)   # raw120 → sign10 order
+    # 'finger' → 133D 그대로
+    # '7part'  → 133D 그대로
+
+    return poses, text, name
 
 
 def _load_one_joint(ann, joint_root, split):
@@ -143,7 +173,11 @@ class SignMotionDataset(data.Dataset):
 
         self.csl_root     = getattr(opt, 'csl_root', None)
         self.phoenix_root = getattr(opt, 'phoenix_root', None)
-        self.joint_root   = getattr(opt, 'joint_root', None)  # NEW
+        self.joint_root   = getattr(opt, 'joint_root', None)
+
+        # ── skeleton mode ──
+        self.skeleton_mode = getattr(opt, 'skeleton_mode', '7part')
+        self.use_sign10_vel = (self.skeleton_mode == 'sign10_vel')
 
         # annotation은 항상 원본 data_root 기준
         self.all_data = _build_annotations(
@@ -151,7 +185,19 @@ class SignMotionDataset(data.Dataset):
             self.csl_root, self.phoenix_root)
 
     def inv_transform(self, data):
-        return data * self.std + self.mean
+        """Inverse transform: denormalize, and for sign10_vel: 210D → 120D."""
+        if self.use_sign10_vel:
+            from utils.sign10_config import sign10_vel_to_rotation
+            # 210D → 120D normalized sign10
+            if isinstance(data, torch.Tensor):
+                data_np = data.cpu().numpy()
+                rot = sign10_vel_to_rotation(data_np)
+                rot = torch.from_numpy(rot).to(data.device).float()
+            else:
+                rot = sign10_vel_to_rotation(data)
+            return rot * self.std + self.mean  # denormalize 120D
+        else:
+            return data * self.std + self.mean
 
     def __len__(self):
         return len(self.all_data)
@@ -159,16 +205,29 @@ class SignMotionDataset(data.Dataset):
     def __getitem__(self, idx):
         ann = self.all_data[idx]
 
-        # joint_root 설정 시 135D joint, 아니면 133D axis-angle
+        # joint_root 설정 시 135D joint, 아니면 axis-angle
         if self.joint_root:
             poses, text, name = _load_one_joint(ann, self.joint_root, self.split)
         else:
-            poses, text, name = _load_one(ann, self.csl_root, self.phoenix_root)
+            # sign10_vel → 120D sign10 order로 로딩 (velocity 변환은 정규화 후)
+            load_mode = 'sign10' if self.use_sign10_vel else self.skeleton_mode
+            poses, text, name = _load_one(
+                ann, self.csl_root, self.phoenix_root,
+                skeleton_mode=load_mode,
+            )
 
         if poses is None:
             return self.__getitem__(random.randint(0, len(self) - 1))
 
+        # ── normalize (120D sign10 mean/std for sign10_vel, 133D for 7part) ──
         poses = (poses - self.mean) / (self.std + 1e-10)
+
+        # ── sign10_vel: 120D → 210D (must be AFTER normalization) ──
+        if self.use_sign10_vel:
+            from utils.sign10_config import rotation_to_sign10_vel
+            poses = rotation_to_sign10_vel(poses)  # [T, 120] → [T, 210]
+
+        # ── length adjustment ──
         poses = _adjust_length(poses, self.min_motion_len, self.max_motion_len,
                                self.unit_length)
 
@@ -180,7 +239,7 @@ class SignMotionDataset(data.Dataset):
             idx = np.linspace(0, T - 1, num=self.window_size, dtype=int)
             poses = poses[idx]
 
-        return torch.from_numpy(poses).float()   # [W, D]  (D=133 or 135)
+        return torch.from_numpy(poses).float()   # [W, D]  (D=210 for sign10_vel, 133 otherwise)
 
 
 # ─── Denoiser Dataset ────────────────────────────────────────
@@ -205,12 +264,16 @@ class SignText2MotionDataset(data.Dataset):
         self.unit_length    = getattr(opt, 'unit_length', 4)
         self.min_motion_len = getattr(opt, 'min_motion_length', 40)
         self.max_motion_len = opt.max_motion_length
-        self.pose_dim       = opt.pose_dim  # 133 or 135
+        self.pose_dim       = opt.pose_dim  # 133, 120, or 210
 
         self.data_root    = getattr(opt, 'data_root', None)
         self.csl_root     = getattr(opt, 'csl_root', None)
         self.phoenix_root = getattr(opt, 'phoenix_root', None)
-        self.joint_root   = getattr(opt, 'joint_root', None)  # NEW
+        self.joint_root   = getattr(opt, 'joint_root', None)
+
+        # ── skeleton mode ──
+        self.skeleton_mode = getattr(opt, 'skeleton_mode', '7part')
+        self.use_sign10_vel = (self.skeleton_mode == 'sign10_vel')
 
         self.all_data = _build_annotations(
             split, opt.sign_dataset, self.data_root,
@@ -251,7 +314,18 @@ class SignText2MotionDataset(data.Dataset):
                     print(f"  Text cache not found, falling back to text strings.")
 
     def inv_transform(self, data):
-        return data * self.std + self.mean
+        """Inverse transform: denormalize, and for sign10_vel: 210D → 120D."""
+        if self.use_sign10_vel:
+            from utils.sign10_config import sign10_vel_to_rotation
+            if isinstance(data, torch.Tensor):
+                data_np = data.cpu().numpy()
+                rot = sign10_vel_to_rotation(data_np)
+                rot = torch.from_numpy(rot).to(data.device).float()
+            else:
+                rot = sign10_vel_to_rotation(data)
+            return rot * self.std + self.mean
+        else:
+            return data * self.std + self.mean
 
     def __len__(self):
         return len(self.all_data)
@@ -262,19 +336,32 @@ class SignText2MotionDataset(data.Dataset):
         if self.joint_root:
             poses, text, name = _load_one_joint(ann, self.joint_root, self.split)
         else:
-            poses, text, name = _load_one(ann, self.csl_root, self.phoenix_root)
+            # sign10_vel → 120D sign10 order로 로딩 (velocity 변환은 정규화 후)
+            load_mode = 'sign10' if self.use_sign10_vel else self.skeleton_mode
+            poses, text, name = _load_one(
+                ann, self.csl_root, self.phoenix_root,
+                skeleton_mode=load_mode,
+            )
 
         if poses is None:
             return self.__getitem__(random.randint(0, len(self) - 1))
 
+        # ── normalize (120D sign10 mean/std for sign10_vel, 133D for 7part) ──
         poses = (poses - self.mean) / (self.std + 1e-10)
+
+        # ── sign10_vel: 120D → 210D (must be AFTER normalization) ──
+        if self.use_sign10_vel:
+            from utils.sign10_config import rotation_to_sign10_vel
+            poses = rotation_to_sign10_vel(poses)  # [T, 120] → [T, 210]
+
+        # ── length adjustment ──
         poses = _adjust_length(poses, self.min_motion_len, self.max_motion_len,
                                self.unit_length)
         m_length = poses.shape[0]
 
         # pad to max for batching
         if m_length < self.max_motion_len:
-            pad = np.zeros((self.max_motion_len - m_length, self.pose_dim))
+            pad = np.zeros((self.max_motion_len - m_length, poses.shape[1]))
             poses = np.concatenate([poses, pad], axis=0)
 
         # ── text output ──

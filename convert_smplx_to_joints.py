@@ -6,11 +6,14 @@ convert_smplx_to_joints.py — SMPL-X 179D PKL → 3D joint coordinates (.npy)
   data/CSL-Daily/poses/{name}/              →  data_joint/CSL-Daily/poses/{name}.npy
   data/Phoenix_2014T/{split}/{name}/        →  data_joint/Phoenix_2014T/{split}/{name}.npy
 
-Joint: 45 joints × 3 = 135D
-  [0:3]    jaw (SMPL-X #22)
-  [3:45]   upper body 14 joints (SMPL-X #0,3,6,9,12-21)
-  [45:90]  left hand 15 joints (SMPL-X #25-39)
-  [90:135] right hand 15 joints (SMPL-X #40-54)
+Joint: 45 joints × 3 = 135D (7-part grouped)
+  [0:12]   torso     — pelvis, spine1, spine2, spine3         (4j × 3D)
+  [12:24]  L_arm     — L_collar, L_shoulder, L_elbow, L_wrist (4j × 3D)
+  [24:36]  R_arm     — R_collar, R_shoulder, R_elbow, R_wrist (4j × 3D)
+  [36:81]  lhand     — 15 joints (index, middle, pinky, ring, thumb × 3)
+  [81:126] rhand     — 15 joints
+  [126:132] head_neck — neck, head                            (2j × 3D)
+  [132:135] jaw       — jaw                                   (1j × 3D)
 
 Usage:
     python convert_smplx_to_joints.py \
@@ -41,11 +44,15 @@ SMPLX_KEYS = [
     'smplx_rhand_pose', 'smplx_jaw_pose', 'smplx_shape', 'smplx_expr',
 ]
 
-UPPER_BODY_IDX = [0, 3, 6, 9, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21]
-JAW_IDX        = [22]
-LHAND_IDX      = list(range(25, 40))
-RHAND_IDX      = list(range(40, 55))
-SELECT_IDX     = JAW_IDX + UPPER_BODY_IDX + LHAND_IDX + RHAND_IDX  # 45
+# Grouped by 7-part for VAE: torso | L_arm | R_arm | lhand | rhand | head_neck | jaw
+TORSO_IDX     = [0, 3, 6, 9]       # pelvis, spine1, spine2, spine3 (4j)
+L_ARM_IDX     = [13, 16, 18, 20]   # L_collar, L_shoulder, L_elbow, L_wrist (4j)
+R_ARM_IDX     = [14, 17, 19, 21]   # R_collar, R_shoulder, R_elbow, R_wrist (4j)
+LHAND_IDX     = list(range(25, 40)) # 15 left hand joints (index,middle,pinky,ring,thumb)
+RHAND_IDX     = list(range(40, 55)) # 15 right hand joints
+HEAD_NECK_IDX = [12, 15]           # neck, head (2j)
+JAW_IDX       = [22]               # jaw (1j)
+SELECT_IDX    = TORSO_IDX + L_ARM_IDX + R_ARM_IDX + LHAND_IDX + RHAND_IDX + HEAD_NECK_IDX + JAW_IDX  # 45
 
 BAD_H2S_IDS = {
     '0DU7wWLK-QU_0-8-rgb_front', '0ICZi26jdaQ_28-5-rgb_front',
@@ -65,6 +72,12 @@ BAD_H2S_IDS = {
     'a4Nxq0QV_WA_9-3-rgb_front', 'fzrJBu2qsM8_11-8-rgb_front',
     'g3Cc_1-V31U_12-3-rgb_front',
 }
+
+# Post-processing: body vs hand joint indices (after reorder)
+#   body: torso(0-3) + L_arm(4-7) + R_arm(8-11) + head_neck(42-43) + jaw(44) = 15 joints
+#   hand: lhand(12-26) + rhand(27-41) = 30 joints
+_BODY_JOINT_IDX = list(range(0, 12)) + list(range(42, 45))  # 15 joints
+_HAND_JOINT_IDX = list(range(12, 42))                        # 30 joints
 
 
 # ─── Helpers ───────────────────────────────────────────────────────────
@@ -113,7 +126,7 @@ def poses179_to_joints(poses_179, body_model, device, chunk_size=512):
 def _remove_spikes(joints, vel_thresh=3.0):
     """
     Joint별 프레임간 velocity 기반 스파이크 탐지 → linear interpolation.
-    joints: [T, 45, 3]
+    joints: [T, J, 3]
     vel_thresh: median velocity의 몇 배를 outlier로 볼지
     """
     T, J, C = joints.shape
@@ -153,7 +166,7 @@ def _remove_spikes(joints, vel_thresh=3.0):
 def _smooth_savgol(joints, window_length=7, polyorder=3):
     """
     Savitzky-Golay filter. 형태 보존하면서 jitter 제거.
-    joints: [T, 45, 3]
+    joints: [T, J, 3]
     """
     from scipy.signal import savgol_filter
 
@@ -166,7 +179,7 @@ def _smooth_savgol(joints, window_length=7, polyorder=3):
         return joints  # 너무 짧으면 smoothing 안 함
 
     smoothed = joints.copy()
-    # [T, 45*3] flatten해서 한번에 처리
+    # [T, J*3] flatten해서 한번에 처리
     flat = smoothed.reshape(T, -1)
     for d in range(flat.shape[1]):
         flat[:, d] = savgol_filter(flat[:, d], wl, polyorder)
@@ -176,10 +189,15 @@ def _smooth_savgol(joints, window_length=7, polyorder=3):
 def postprocess_joints(joints, smooth=True, vel_thresh=3.0,
                        savgol_window=7, savgol_poly=3):
     """스파이크 제거 → Savitzky-Golay smoothing. joints: [T, 45, 3]
-    body(0-14): spike 제거 + savgol smoothing
-    hand(15-44): spike만 관대하게 제거, savgol 미적용 (빠른 손동작 보존)"""
-    body = joints[:, :15, :].copy()
-    hand = joints[:, 15:, :].copy()
+    body(torso+arms+head_neck+jaw): spike 제거 + savgol smoothing
+    hand(lhand+rhand): spike만 관대하게 제거, savgol 미적용 (빠른 손동작 보존)
+
+    7-part grouped layout:
+      body = [0:12] torso+arms + [42:45] head_neck+jaw  (15 joints)
+      hand = [12:42] lhand+rhand                        (30 joints)
+    """
+    body = joints[:, _BODY_JOINT_IDX, :].copy()   # [T, 15, 3]
+    hand = joints[:, _HAND_JOINT_IDX, :].copy()   # [T, 30, 3]
 
     body = _remove_spikes(body, vel_thresh=vel_thresh)
     hand = _remove_spikes(hand, vel_thresh=vel_thresh * 3)  # 손가락은 훨씬 관대하게
@@ -188,7 +206,11 @@ def postprocess_joints(joints, smooth=True, vel_thresh=3.0,
         body = _smooth_savgol(body, savgol_window, savgol_poly)
         # hand는 savgol 미적용 — 수어 손가락 동작은 고주파 신호가 의미 있음
 
-    return np.concatenate([body, hand], axis=1)
+    # Reassemble in original order
+    result = joints.copy()
+    result[:, _BODY_JOINT_IDX, :] = body
+    result[:, _HAND_JOINT_IDX, :] = hand
+    return result
 
 
 def _convert_and_save(frame_paths, out_path, body_model, device, chunk_size,
